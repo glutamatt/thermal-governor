@@ -138,7 +138,7 @@ impl ThermalTable {
 
     /// Compute target cap given current temp and current cap.
     /// Step-down is immediate (jump to correct level).
-    /// Step-up is gradual (one level at a time, with hysteresis).
+    /// Step-up is gradual (+200 MHz per poll, capped at next level, gated by hysteresis).
     fn target_cap(&self, temp: i32, current_cap: u64) -> u64 {
         let levels = self.all_levels();
         // thresholds[i] gates transition from levels[i] down to levels[i+1]
@@ -158,7 +158,7 @@ impl ThermalTable {
             return down_cap;
         }
 
-        // Step UP: go only ONE level up, with hysteresis
+        // Step UP: ramp gradually toward next level, with hysteresis
         let cur_level = self.current_level(current_cap);
         if cur_level > 0 {
             // To step up from cur_level to cur_level-1, temp must be below
@@ -166,7 +166,8 @@ impl ThermalTable {
             let thresh_idx = cur_level - 1; // thresholds[thresh_idx] caused us to drop to cur_level
             let up_thresh = self.thresholds[thresh_idx] - self.hysteresis;
             if temp < up_thresh {
-                return levels[cur_level - 1]; // go up ONE level only
+                let next_level_cap = levels[cur_level - 1];
+                return (current_cap + FREQ_STEP * 2).min(next_level_cap); // +200 MHz toward next level
             }
         }
 
