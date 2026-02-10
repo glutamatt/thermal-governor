@@ -136,18 +136,25 @@ impl ThermalTable {
         4 // at or below lowest
     }
 
-    /// Compute target cap given current temp and current cap.
+    /// Compute target cap given current temp, rate of change, and current cap.
     /// Step-down is immediate (jump to correct level).
     /// Step-up is gradual (+200 MHz per poll, capped at next level, gated by hysteresis).
-    fn target_cap(&self, temp: i32, current_cap: u64) -> u64 {
+    /// temp_delta: temperature change since last poll (positive = heating up).
+    fn target_cap(&self, temp: i32, temp_delta: i32, current_cap: u64) -> u64 {
         let levels = self.all_levels();
         // thresholds[i] gates transition from levels[i] down to levels[i+1]
         // i.e., if temp > thresholds[i], you should be at levels[i+1] or lower
 
+        // Predictive bias: if temp is rising fast, lower effective thresholds
+        // so we step down before actually hitting the wall.
+        // Use half the delta to avoid over-reacting to transient spikes.
+        // e.g., +16°C/poll → bias = 8, effectively triggers 8°C earlier
+        let bias = temp_delta.max(0) / 2;
+
         // Step DOWN: find the correct level for this temperature (immediate)
         let mut target_level: usize = 0; // default: max_cap
         for i in 0..4 {
-            if temp > self.thresholds[i] {
+            if temp + bias > self.thresholds[i] {
                 target_level = i + 1;
             }
         }
@@ -521,13 +528,16 @@ fn governor(profile: Profile, state: &mut State, stop: &AtomicBool) {
     let mut last_tune = Instant::now();
     let mut last_persist = Instant::now();
     let mut cooldown: u32 = 0; // polls to wait before allowing step-up
+    let mut prev_temp: i32 = cpu_temp();
 
     while !stop.load(Ordering::Relaxed) {
         let temp = cpu_temp();
+        let temp_delta = temp - prev_temp;
+        prev_temp = temp;
         let rpm = fan_rpm();
 
         let table = state.table(profile);
-        let raw_target = table.target_cap(temp, current_cap);
+        let raw_target = table.target_cap(temp, temp_delta, current_cap);
         let lowest = table.lowest_cap();
 
         // Apply cooldown: suppress step-ups for a few polls after a step-down
@@ -549,6 +559,8 @@ fn governor(profile: Profile, state: &mut State, stop: &AtomicBool) {
             ));
             if new_cap < current_cap {
                 cooldown = 3; // after step-down, wait 3 polls (6s) before stepping up
+            } else {
+                cooldown = 1; // after step-up, wait 1 poll (2s) for thermal stabilization
             }
             current_cap = new_cap;
         }
