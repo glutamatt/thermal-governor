@@ -26,6 +26,7 @@ const PERSIST_INTERVAL: Duration = Duration::from_secs(300);
 const FREQ_STEP: u64 = 100_000; // 100 MHz
 const MIN_CAP: u64 = 1_200_000; // 1.2 GHz absolute floor
 const MAX_CAP: u64 = 4_500_000; // 4.5 GHz absolute ceiling
+const MIN_SPREAD: u64 = 200_000; // 200 MHz minimum gap between adjacent levels
 
 const STATE_FILE: &str = "/var/lib/thermal-governor/tuned-params.json";
 
@@ -63,6 +64,14 @@ impl Profile {
             Self::PowerSaver => "power",
             Self::Balanced => "balance_power",
             Self::Performance => "performance",
+        }
+    }
+
+    fn ceiling(self) -> u64 {
+        match self {
+            Self::PowerSaver => 3_500_000,   // 3.5 GHz — no point going higher for fanless
+            Self::Balanced => 4_500_000,
+            Self::Performance => 4_500_000,
         }
     }
 }
@@ -184,6 +193,29 @@ impl ThermalTable {
 
     fn lowest_cap(&self) -> u64 {
         self.caps[3]
+    }
+
+    fn enforce_invariants(&mut self, ceiling: u64) {
+        // Clamp max_cap to profile ceiling
+        self.max_cap = self.max_cap.clamp(MIN_CAP, ceiling);
+
+        // Enforce monotonically decreasing with minimum spread:
+        // max_cap > caps[0] > caps[1] > caps[2] > caps[3]
+        let mut prev = self.max_cap;
+        for c in &mut self.caps {
+            let upper = if prev > MIN_CAP + MIN_SPREAD {
+                prev - MIN_SPREAD
+            } else {
+                MIN_CAP
+            };
+            if *c > upper {
+                *c = upper;
+            }
+            if *c < MIN_CAP {
+                *c = MIN_CAP;
+            }
+            prev = *c;
+        }
     }
 }
 
@@ -408,13 +440,12 @@ fn auto_tune(profile: Profile, stats: &TuneStats, state: &mut State) {
 
     match profile {
         Profile::PowerSaver => {
-            if fan_pct == 0 && max < t.thresholds[2] {
-                // Fans OFF, headroom → raise max_cap and all step-down caps
+            if fan_pct == 0 && max < t.thresholds[2] && avg >= 48 {
+                // Fans OFF under actual load → raise max_cap only (not step-down caps)
                 t.max_cap = clamp_freq(t.max_cap + FREQ_STEP);
-                for c in &mut t.caps { *c = clamp_freq(*c + FREQ_STEP); }
-                log("tuner", &format!("[ps] Fans OFF max={max}°C → all caps +100MHz"));
+                log("tuner", &format!("[ps] Fans OFF under load avg={avg}°C → max_cap +100MHz"));
             } else if fan_pct > 20 {
-                // Fans active too much → lower caps
+                // Fans active too much → lower all caps
                 t.max_cap = clamp_freq(t.max_cap.saturating_sub(FREQ_STEP));
                 for c in &mut t.caps { *c = clamp_freq(c.saturating_sub(FREQ_STEP)); }
                 log("tuner", &format!("[ps] Fans {fan_pct}% → all caps -100MHz"));
@@ -444,7 +475,6 @@ fn auto_tune(profile: Profile, stats: &TuneStats, state: &mut State) {
                 t.max_cap = clamp_freq(t.max_cap.saturating_sub(FREQ_STEP * 2));
                 t.caps[0] = clamp_freq(t.caps[0].saturating_sub(FREQ_STEP * 2));
                 t.caps[1] = clamp_freq(t.caps[1].saturating_sub(FREQ_STEP));
-                t.caps[2] = clamp_freq(t.caps[2].saturating_sub(FREQ_STEP));
                 log("tuner", &format!("[perf] DANGER max={max}°C → aggressive cap reduction"));
             } else if max > t.thresholds[2] {
                 t.max_cap = clamp_freq(t.max_cap.saturating_sub(FREQ_STEP));
@@ -453,6 +483,9 @@ fn auto_tune(profile: Profile, stats: &TuneStats, state: &mut State) {
             }
         }
     }
+
+    // Enforce invariants after any adjustment
+    state.table_mut(profile).enforce_invariants(profile.ceiling());
 
     let t = state.table(profile);
     log("tuner", &format!(
