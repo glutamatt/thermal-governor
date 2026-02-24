@@ -74,6 +74,16 @@ impl Profile {
             Self::Performance => 4_500_000,
         }
     }
+
+    /// Minimum cap floors per level — prevents caps from collapsing to MIN_CAP over time.
+    /// The auto-tuner can lower caps toward these floors but not below them.
+    fn cap_floors(self) -> [u64; 4] {
+        match self {
+            Self::PowerSaver => [1_500_000, 1_400_000, 1_300_000, MIN_CAP],
+            Self::Balanced => [2_800_000, 2_200_000, 1_800_000, 1_400_000],
+            Self::Performance => [3_000_000, 2_400_000, 2_000_000, 1_600_000],
+        }
+    }
 }
 
 // =============================================================================
@@ -203,25 +213,30 @@ impl ThermalTable {
         self.caps[3]
     }
 
-    fn enforce_invariants(&mut self, ceiling: u64) {
+    fn enforce_invariants(&mut self, profile: Profile) {
+        let ceiling = profile.ceiling();
+        let floors = profile.cap_floors();
+
         // Clamp max_cap to profile ceiling
         self.max_cap = self.max_cap.clamp(MIN_CAP, ceiling);
 
+        // Power-saver threshold[0] must stay above idle temp to be useful
+        if let Profile::PowerSaver = profile {
+            self.thresholds[0] = self.thresholds[0].max(48);
+        }
+
         // Enforce monotonically decreasing with minimum spread:
         // max_cap > caps[0] > caps[1] > caps[2] > caps[3]
+        // Also enforce per-level floors to prevent cap collapse over time.
         let mut prev = self.max_cap;
-        for c in &mut self.caps {
+        for (i, c) in self.caps.iter_mut().enumerate() {
             let upper = if prev > MIN_CAP + MIN_SPREAD {
                 prev - MIN_SPREAD
             } else {
                 MIN_CAP
             };
-            if *c > upper {
-                *c = upper;
-            }
-            if *c < MIN_CAP {
-                *c = MIN_CAP;
-            }
+            let floor = floors[i].min(upper); // floor yields to monotonicity
+            *c = (*c).clamp(floor, upper);
             prev = *c;
         }
     }
@@ -348,7 +363,8 @@ fn cpu_temp() -> i32 {
 fn fan_rpm() -> u32 {
     let f1 = read_sysfs_i64(FAN1_SENSOR).unwrap_or(0) as u32;
     let f2 = read_sysfs_i64(FAN2_SENSOR).unwrap_or(0) as u32;
-    f1.max(f2)
+    let max = f1.max(f2);
+    if max >= 60_000 { 0 } else { max } // 0xFFFF = sensor error
 }
 
 fn cpufreq_dirs() -> Vec<PathBuf> {
@@ -444,62 +460,79 @@ fn auto_tune(profile: Profile, stats: &TuneStats, state: &mut State) {
     let fan_pct = stats.fan_pct();
     let lowest_pct = stats.lowest_pct();
     let avg = stats.avg_temp();
+
+    let before_caps = state.table(profile).caps;
+    let before_max = state.table(profile).max_cap;
+    let before_thresh = state.table(profile).thresholds;
+
     let t = state.table_mut(profile);
+    let mut reason: Option<String> = None;
 
     match profile {
         Profile::PowerSaver => {
             if fan_pct == 0 && max < t.thresholds[2] && avg >= 48 {
-                // Fans OFF under actual load → raise max_cap only (not step-down caps)
+                // Fans OFF under actual load → raise all caps to recover from collapse
                 t.max_cap = clamp_freq(t.max_cap + FREQ_STEP);
-                log("tuner", &format!("[ps] Fans OFF under load avg={avg}°C → max_cap +100MHz"));
+                for c in &mut t.caps { *c = clamp_freq(*c + FREQ_STEP); }
+                reason = Some(format!("[ps] Fans OFF under load avg={avg}°C → all caps +100MHz"));
             } else if fan_pct > 20 {
                 // Fans active too much → lower all caps
                 t.max_cap = clamp_freq(t.max_cap.saturating_sub(FREQ_STEP));
                 for c in &mut t.caps { *c = clamp_freq(c.saturating_sub(FREQ_STEP)); }
-                log("tuner", &format!("[ps] Fans {fan_pct}% → all caps -100MHz"));
+                reason = Some(format!("[ps] Fans {fan_pct}% → all caps -100MHz"));
             } else if fan_pct > 0 {
-                // Occasional fan → tighten threshold
-                t.thresholds[0] = (t.thresholds[0] - 1).clamp(40, 55);
-                log("tuner", &format!("[ps] Fan blips ({fan_pct}%) → thresh[0]={}", t.thresholds[0]));
+                // Occasional fan → tighten threshold (floor at 48°C, above idle temp)
+                t.thresholds[0] = (t.thresholds[0] - 1).clamp(48, 55);
+                reason = Some(format!("[ps] Fan blips ({fan_pct}%) → thresh[0]={}", t.thresholds[0]));
             }
         }
         Profile::Balanced => {
             if max < (t.thresholds[2] - 5) && lowest_pct == 0 {
+                // Headroom → raise ALL caps to recover collapsed lower levels
                 t.max_cap = clamp_freq(t.max_cap + FREQ_STEP);
-                t.caps[0] = clamp_freq(t.caps[0] + FREQ_STEP);
-                log("tuner", &format!("[bal] Headroom max={max}°C → top caps +100MHz"));
+                for c in &mut t.caps { *c = clamp_freq(*c + FREQ_STEP); }
+                reason = Some(format!("[bal] Headroom max={max}°C → all caps +100MHz"));
             } else if max > t.thresholds[3] {
                 t.max_cap = clamp_freq(t.max_cap.saturating_sub(FREQ_STEP));
                 t.caps[0] = clamp_freq(t.caps[0].saturating_sub(FREQ_STEP));
-                log("tuner", &format!("[bal] Hot max={max}°C → top caps -100MHz"));
+                reason = Some(format!("[bal] Hot max={max}°C → top caps -100MHz"));
             }
         }
         Profile::Performance => {
             if max < (t.thresholds[2] - 3) && lowest_pct == 0 {
+                // Headroom → raise ALL caps to recover collapsed lower levels
                 t.max_cap = clamp_freq(t.max_cap + FREQ_STEP);
-                t.caps[0] = clamp_freq(t.caps[0] + FREQ_STEP);
-                log("tuner", &format!("[perf] Headroom max={max}°C → top caps +100MHz"));
+                for c in &mut t.caps { *c = clamp_freq(*c + FREQ_STEP); }
+                reason = Some(format!("[perf] Headroom max={max}°C → all caps +100MHz"));
             } else if max > 95 {
                 t.max_cap = clamp_freq(t.max_cap.saturating_sub(FREQ_STEP * 2));
                 t.caps[0] = clamp_freq(t.caps[0].saturating_sub(FREQ_STEP * 2));
                 t.caps[1] = clamp_freq(t.caps[1].saturating_sub(FREQ_STEP));
-                log("tuner", &format!("[perf] DANGER max={max}°C → aggressive cap reduction"));
+                reason = Some(format!("[perf] DANGER max={max}°C → aggressive cap reduction"));
             } else if max > t.thresholds[2] {
                 t.max_cap = clamp_freq(t.max_cap.saturating_sub(FREQ_STEP));
                 t.caps[0] = clamp_freq(t.caps[0].saturating_sub(FREQ_STEP));
-                log("tuner", &format!("[perf] Warm max={max}°C → top caps -100MHz"));
+                reason = Some(format!("[perf] Warm max={max}°C → top caps -100MHz"));
             }
         }
     }
 
-    // Enforce invariants after any adjustment
-    state.table_mut(profile).enforce_invariants(profile.ceiling());
+    // Enforce invariants (includes cap floors to prevent collapse)
+    state.table_mut(profile).enforce_invariants(profile);
 
     let t = state.table(profile);
-    log("tuner", &format!(
-        "[{}] samples={} avg={avg}°C max={max}°C fan={fan_pct}% lowest={lowest_pct}% caps={} thresh={}",
-        profile.name(), stats.samples, t.caps_str(), t.thresholds_str(),
-    ));
+    let changed = t.max_cap != before_max || t.caps != before_caps || t.thresholds != before_thresh;
+
+    // Only log when something actually changed (suppress no-op headroom spam)
+    if changed {
+        if let Some(r) = reason {
+            log("tuner", &r);
+        }
+        log("tuner", &format!(
+            "[{}] samples={} avg={avg}°C max={max}°C fan={fan_pct}% lowest={lowest_pct}% caps={} thresh={}",
+            profile.name(), stats.samples, t.caps_str(), t.thresholds_str(),
+        ));
+    }
 }
 
 // =============================================================================
@@ -576,7 +609,9 @@ fn governor(profile: Profile, state: &mut State, stop: &AtomicBool) {
             last_persist = Instant::now();
         }
 
-        thread::sleep(POLL_INTERVAL);
+        // Poll faster when hot to catch spikes before they hit critical temps
+        let poll_dur = if temp >= 80 { Duration::from_millis(500) } else { POLL_INTERVAL };
+        thread::sleep(poll_dur);
     }
 
     log(profile.name(), "Governor stopped");
@@ -650,6 +685,11 @@ fn main() {
     eprintln!("================================================\n");
 
     let mut state = State::load();
+
+    // Fix any caps that collapsed below floors in previous runs
+    for &p in &[Profile::PowerSaver, Profile::Balanced, Profile::Performance] {
+        state.table_mut(p).enforce_invariants(p);
+    }
 
     let initial = detect_profile().unwrap_or_else(|| {
         log("main", "Cannot detect profile, defaulting to balanced");
