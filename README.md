@@ -20,13 +20,14 @@ The built-in GNOME power profiles only set static EPP (Energy Performance Prefer
 
 `thermal-governor` replaces static CPU settings with a **dynamic feedback loop**:
 
-- Reads CPU package temperature every 2 seconds
+- Reads CPU package temperature every 2 seconds (500ms when temp ≥ 80°C for faster spike response)
 - Adjusts `scaling_max_freq` based on per-profile thermal tables
 - Steps **down immediately** when temperature rises (multi-level jump), with **predictive bias** that uses temperature rate-of-change to trigger step-downs early
 - Steps **up gradually** (+200 MHz per poll) with hysteresis and cooldown to prevent oscillation
-- **Enforces monotonicity invariants** — frequency caps are always strictly decreasing with minimum 200 MHz spread between levels
+- **Enforces monotonicity invariants** — frequency caps are always strictly decreasing with minimum 200 MHz spread between levels, and per-level floors prevent long-term cap collapse
 - **Auto-tunes** its own parameters based on observed behavior (fan activity, temperature trends)
-- **Persists learned parameters** across reboots
+- **Persists learned parameters** across reboots — collapsed caps are repaired on startup
+- **Filters sensor errors** — bogus fan readings (e.g. 0xFFFF) are discarded
 
 ## Profiles
 
@@ -63,11 +64,13 @@ All tests run with 100% all-core load (16 threads) for 60 seconds:
 The governor learns from its own operation:
 
 - **Every 2 minutes**: analyzes a rolling window of temperature/fan samples
-- **Power Saver**: if fans stayed off under actual load (avg ≥ 48°C) → raises max_cap by 100 MHz up to a 3.5 GHz ceiling (finds the true fanless ceiling); if fans kicked on too much → lowers all caps
-- **Performance**: if temperature never approached danger zone → raises caps; if it got too hot → aggressively lowers them
-- **Balanced**: adjusts to stay in the sweet spot
+- **Power Saver**: if fans stayed off under actual load (avg ≥ 48°C) → raises all caps by 100 MHz (finds the true fanless ceiling); if fans kicked on too much → lowers all caps; threshold[0] is floored at 48°C to stay above idle temp
+- **Performance**: if temperature never approached danger zone → raises all caps; if it got too hot → aggressively lowers top caps (lower caps protected by floors)
+- **Balanced**: raises all caps when there's headroom; lowers top caps when too hot
+- **Cap floors** prevent long-term collapse: the auto-tuner can lower caps toward per-level minimums but not below them (e.g. performance: 3.0/2.4/2.0/1.6 GHz)
 - **Every 5 minutes**: persists learned parameters to `/var/lib/thermal-governor/tuned-params.json`
 - Parameters survive reboots and improve over days of use
+- **Silent when idle**: tuner only logs when parameters actually change
 
 ## Architecture
 
@@ -89,7 +92,7 @@ The governor learns from its own operation:
 ┌──────────────────────────────────────────────────────┐
 │               Governor Thread                         │
 │                                                       │
-│  every 2s:                                            │
+│  every 2s (500ms when temp ≥ 80°C):                    │
 │    read temp (x86_pkg_temp) + fan RPM (thinkpad)      │
 │    compute target_cap from ThermalTable               │
 │    apply scaling_max_freq if changed                  │
@@ -202,7 +205,11 @@ When temperature exceeds a threshold, the governor immediately jumps to the corr
 
 ### Step-Up (Gradual)
 
-When temperature drops, the governor ramps up **+200 MHz per poll** toward the next level, gated by hysteresis (default 5°C for Performance/Balanced, 2°C for Power Saver). After any step-down, a **cooldown period** (6 seconds) prevents immediate step-up. After each step-up, a **1-poll pause** (2 seconds) lets the thermal sensor stabilize before the next increase. This produces a smooth ramp that naturally settles at the thermally sustainable frequency.
+When temperature drops, the governor ramps up **+200 MHz per poll** toward the next level, gated by hysteresis (default 5°C for Performance/Balanced, 2°C for Power Saver). After any step-down, a **cooldown period** (6 seconds) prevents immediate step-up. After each step-up, a **1-poll pause** lets the thermal sensor stabilize before the next increase. This produces a smooth ramp that naturally settles at the thermally sustainable frequency.
+
+### Adaptive Polling
+
+The governor polls at 2-second intervals normally, but switches to **500ms** when temperature reaches 80°C or above. This allows faster reaction to thermal spikes that can occur between standard 2-second polls, reducing the chance of temperatures reaching critical levels (100°C+).
 
 ### Predictive Thermal Bias
 
@@ -216,7 +223,7 @@ Every 2 minutes, the tuner analyzes collected samples:
 - **Max/average temperature**: thermal headroom assessment
 - **Time at lowest cap**: how often the emergency floor was hit
 
-Based on these metrics, it nudges frequency caps up or down by 100 MHz steps, clamped within safe bounds. After every adjustment, `enforce_invariants()` guarantees caps remain monotonically decreasing with at least 200 MHz spread between adjacent levels, and within per-profile ceilings (3.5 GHz for Power Saver, 4.5 GHz for others).
+Based on these metrics, it nudges frequency caps up or down by 100 MHz steps. Headroom events raise **all** cap levels (not just the top), allowing collapsed lower caps to recover gradually. After every adjustment, `enforce_invariants()` guarantees caps remain monotonically decreasing with at least 200 MHz spread between adjacent levels, within per-profile ceilings (3.5 GHz for Power Saver, 4.5 GHz for others), and above per-level floors that prevent long-term collapse to `MIN_CAP`.
 
 ## Requirements
 
