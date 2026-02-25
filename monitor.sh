@@ -26,9 +26,11 @@ THR_BASE=$(cat "$THROTTLE" 2>/dev/null || echo 0)
 read_int()  { cat "$1" 2>/dev/null || echo 0; }
 read_temp() { echo $(( $(read_int "$TEMP_SENSOR") / 1000 )); }
 
+FAN_RPM_FLOOR=2500  # must match src/main.rs
+
 read_fan() {
     local v; v=$(read_int "$1")
-    (( v >= 60000 )) && echo 0 || echo "$v"
+    (( v >= 60000 || v < FAN_RPM_FLOOR )) && echo 0 || echo "$v"
 }
 
 ghz() { awk "BEGIN{printf \"%.1f\", $1/1000000}"; }
