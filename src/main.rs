@@ -60,8 +60,8 @@ struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            kp: 100.0,
-            kd: 50.0,
+            kp: 30.0,
+            kd: 60.0,
             max_ramp: 400,
             min_cap: 1200,
             max_cap: 4500,
@@ -167,11 +167,10 @@ impl Profile {
     }
 
     fn epp(self) -> &'static str {
-        match self {
-            Self::PowerSaver => "power",
-            Self::Balanced => "balance_power",
-            Self::Performance => "performance",
-        }
+        // Always "performance": let the CPU use all cycles up to the freq cap.
+        // The PD controller is the sole thermal control knob.
+        let _ = self;
+        "performance"
     }
 }
 
@@ -382,6 +381,7 @@ fn set_max_freq(dirs: &[PathBuf], freq: u64) {
     }
 }
 
+
 fn apply_base(dirs: &[PathBuf], min_freq: u64, epp: &str, boost: u8) {
     let min_val = min_freq.to_string();
     for d in dirs {
@@ -440,13 +440,12 @@ fn freq_ghz(freq: u64) -> String {
 // =============================================================================
 
 fn poll_interval(temp: i32, target: i32, rate: f64) -> Duration {
-    if rate > 0.0 || temp > target - 5 {
-        let urgency = (temp - target + 5).max(0) as f64 + rate.max(0.0);
-        let ms = 2000.0 - urgency * 150.0;
-        Duration::from_millis(ms.clamp(200.0, 2000.0) as u64)
-    } else {
-        Duration::from_secs(2)
-    }
+    // Direct PD doesn't need fast polling — one poll sets the right cap.
+    // Only speed up when significantly over target or heating fast.
+    let over = (temp - target).max(0) as f64;
+    let urgency = over + (rate * 2.0).max(0.0);
+    let ms = 2000.0 - urgency * 100.0;
+    Duration::from_millis(ms.clamp(500.0, 2000.0) as u64)
 }
 
 // =============================================================================
@@ -600,13 +599,23 @@ fn governor(profile: Profile, state: &mut State, stop: &AtomicBool) {
         let rate = temp_history.rate();
         let error = target as f64 - temp as f64;
 
-        let adjustment = (error * cfg.kp_khz() + rate * cfg.kd_khz()) as i64;
-        let adjustment = adjustment.min(cfg.max_ramp_khz());
+        // Time-normalized incremental PD:
+        // - Accumulates adjustments → finds equilibrium where error=0
+        // - poll_secs normalization → consistent behavior at any poll rate
+        // - KD subtracted: heating (rate>0) → lower cap, cooling (rate<0) → higher cap
+        let adj_per_sec = error * cfg.kp_khz() - rate * cfg.kd_khz();
+        let adj = (adj_per_sec * poll_secs) as i64;
+
+        // Ramp-up limited, step-down unlimited
+        let max_up = (cfg.max_ramp_khz() as f64 * poll_secs) as i64;
+        let adj = if adj > 0 { adj.min(max_up) } else { adj };
 
         let new_cap =
-            (cap as i64 + adjustment).clamp(cfg.min_cap_khz() as i64, ceiling as i64) as u64;
+            (cap as i64 + adj).clamp(cfg.min_cap_khz() as i64, ceiling as i64) as u64;
 
-        if new_cap != cap {
+        // Deadband: ignore cap changes < 100 MHz to filter sensor noise
+        let cap_delta = (new_cap as i64 - cap as i64).unsigned_abs();
+        if cap_delta >= 100_000 {
             set_max_freq(&dirs, new_cap);
             let arrow = if new_cap < cap { "↓" } else { "↑" };
             log(
@@ -619,6 +628,7 @@ fn governor(profile: Profile, state: &mut State, stop: &AtomicBool) {
             );
             cap = new_cap;
         }
+
 
         if window.elapsed() >= cfg.adjust_interval() {
             adjust_target(profile, &window, state, &cfg, target, temp);
