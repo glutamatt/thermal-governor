@@ -31,11 +31,11 @@ The built-in GNOME power profiles only set static EPP (Energy Performance Prefer
 
 ## Profiles
 
-| Profile | EPP | Thermal Target | Strategy |
-|---|---|---|---|
-| **Power Saver** | `power` | Stay below ~58°C | Aggressively cap frequency to keep fans off |
-| **Balanced** | `balance_power` | Stay below ~80°C | Moderate caps, accept some fan noise |
-| **Performance** | `performance` | Stay below ~95°C | Maximum sustained frequency without hitting thermal throttle |
+| Profile | EPP | Goal |
+|---|---|---|
+| **Performance** | `performance` | Maximum sustained performance without CPU throttling |
+| **Balanced** | `balance_power` | Best performance compromise between the two other profiles |
+| **Power Saver** | `power` | Maximum performance with as little fan activity as possible |
 
 Profile switching is automatic — the daemon listens to GNOME's power-profiles-daemon via D-Bus and reacts instantly when you switch profiles in Settings.
 
