@@ -8,6 +8,7 @@ FAN1="/sys/class/hwmon/hwmon7/fan1_input"
 FAN2="/sys/class/hwmon/hwmon7/fan2_input"
 THROTTLE="/sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_total_time_ms"
 STATE_FILE="/var/lib/thermal-governor/tuned-params.json"
+CONFIG_FILE="/etc/thermal-governor/config.json"
 CPU0_MAX="/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq"
 CPU0_CUR="/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq"
 
@@ -26,11 +27,13 @@ THR_BASE=$(cat "$THROTTLE" 2>/dev/null || echo 0)
 read_int()  { cat "$1" 2>/dev/null || echo 0; }
 read_temp() { echo $(( $(read_int "$TEMP_SENSOR") / 1000 )); }
 
-FAN_RPM_FLOOR=${FAN_RPM_FLOOR:-2500}  # override via env to match governor
+# Read config value with jq, fallback to default
+cfg_val() { jq -r "$1 // $2" "$CONFIG_FILE" 2>/dev/null || echo "$2"; }
 
 read_fan() {
+    local floor; floor=$(cfg_val .fan_rpm_floor 2500)
     local v; v=$(read_int "$1")
-    (( v >= 60000 || v < FAN_RPM_FLOOR )) && echo 0 || echo "$v"
+    (( v >= 60000 || v < floor )) && echo 0 || echo "$v"
 }
 
 ghz() { awk "BEGIN{printf \"%.1f\", $1/1000000}"; }
@@ -136,10 +139,20 @@ while true; do
     pf_t=$(jq -r '.performance_target // 85' "$STATE_FILE" 2>/dev/null || echo 85)
     bl_t=$(( (ps_t + pf_t) / 2 ))
 
+    # Read config for ceilings (MHz → kHz)
+    ps_ceil=$(( $(cfg_val .ps_ceiling 3500) * 1000 ))
+    bal_ceil=$(( $(cfg_val .bal_ceiling 4500) * 1000 ))
+    perf_ceil=$(( $(cfg_val .perf_ceiling 4500) * 1000 ))
+    c_kp=$(cfg_val .kp 100)
+    c_kd=$(cfg_val .kd 50)
+    c_ramp=$(cfg_val .max_ramp 400)
+    c_fan_budget=$(cfg_val .fan_budget 100)
+    c_thr_budget=$(cfg_val .throttle_budget_ms 0)
+
     case "$profile" in
-        power-saver) target=$ps_t; epp="power";         ceil=3500000 ;;
-        performance) target=$pf_t; epp="performance";    ceil=4500000 ;;
-        *)           target=$bl_t; epp="balance_power";  ceil=4500000 ;;
+        power-saver) target=$ps_t; epp="power";        ceil=$ps_ceil ;;
+        performance) target=$pf_t; epp="performance";   ceil=$perf_ceil ;;
+        *)           target=$bl_t; epp="balance_power"; ceil=$bal_ceil ;;
     esac
 
     error=$((target - temp))
@@ -192,9 +205,11 @@ while true; do
     printf "       Rate   "; rate_color "$rate"
     printf "%+6s°C/s${N}\n" "$rate"
 
+    min_cap_khz=$(( $(cfg_val .min_cap 1200) * 1000 ))
+    min_cap_ghz=$(ghz "$min_cap_khz")
     printf "  Cap       ${B}%5sGHz${N}  " "$cap_ghz"
-    bar "$cap" 1200000 "$ceil" 24
-    printf " ${D}1.2──────────────%s${N}\n" "$ceil_ghz"
+    bar "$cap" "$min_cap_khz" "$ceil" 24
+    printf " ${D}%s──────────────%s${N}\n" "$min_cap_ghz" "$ceil_ghz"
 
     printf "  Actual    ${D}%5sGHz${N}\n" "$cur_ghz"
 
@@ -205,6 +220,13 @@ while true; do
     printf "  PS ${B}%d°C${N}" "$ps_t"
     printf "    Perf ${B}%d°C${N}" "$pf_t"
     printf "    Bal ${D}%d°C${N}\n" "$bl_t"
+
+    printf "${D}"; printf '─%.0s' {1..62}; printf "${N}\n"
+
+    # Config
+    printf "  ${B}CONFIG${N}  ${D}(${CONFIG_FILE})${N}\n"
+    printf "  KP=${B}%s${N}  KD=${B}%s${N}  Ramp=${B}%s${N}MHz" "$c_kp" "$c_kd" "$c_ramp"
+    printf "  FanBudget=${B}%s${N}  ThrBudget=${B}%s${N}ms\n" "$c_fan_budget" "$c_thr_budget"
 
     printf "${D}"; printf '─%.0s' {1..62}; printf "${N}\n"
 

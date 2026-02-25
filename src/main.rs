@@ -22,24 +22,120 @@ const HWP_BOOST_PATH: &str = "/sys/devices/system/cpu/intel_pstate/hwp_dynamic_b
 const THROTTLE_TIME_PATH: &str =
     "/sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_total_time_ms";
 
-// =============================================================================
-// PD controller constants
-// =============================================================================
-
-const KP: f64 = 100_000.0; // 100 MHz per °C error
-const KD: f64 = 50_000.0; // 50 MHz per °C/s rate
-const MAX_RAMP: i64 = 400_000; // 400 MHz max step-up per poll
-const MIN_CAP: u64 = 1_200_000; // 1.2 GHz floor
-const MAX_CAP: u64 = 4_500_000; // 4.5 GHz ceiling
-
-const ADJUST_INTERVAL: Duration = Duration::from_secs(60);
-const RATE_WINDOW: Duration = Duration::from_secs(16);
-const PERSIST_INTERVAL: Duration = Duration::from_secs(300);
-
-const DEFAULT_FAN_BUDGET: f64 = 100.0; // rotations per 60s window
-const DEFAULT_THROTTLE_BUDGET_MS: u64 = 0; // ms per 60s window
-
 const STATE_FILE: &str = "/var/lib/thermal-governor/tuned-params.json";
+const CONFIG_FILE: &str = "/etc/thermal-governor/config.json";
+
+// =============================================================================
+// Config (all knobs — hot-reloaded from CONFIG_FILE)
+// =============================================================================
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct Config {
+    // PD gains (MHz units: kp=100 means 100 MHz per °C error)
+    kp: f64,
+    kd: f64,
+    max_ramp: u32, // MHz, max step-up per poll
+
+    // Frequency limits (MHz)
+    min_cap: u32,
+    max_cap: u32,
+    ps_ceiling: u32,
+    bal_ceiling: u32,
+    perf_ceiling: u32,
+
+    // Fan
+    fan_rpm_floor: u32,
+    fan_budget: f64, // rotations per adjust window
+
+    // Throttle
+    throttle_budget_ms: u64,
+
+    // Timing (seconds)
+    adjust_interval_secs: u64,
+    rate_window_secs: u64,
+    persist_interval_secs: u64,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            kp: 100.0,
+            kd: 50.0,
+            max_ramp: 400,
+            min_cap: 1200,
+            max_cap: 4500,
+            ps_ceiling: 3500,
+            bal_ceiling: 4500,
+            perf_ceiling: 4500,
+            fan_rpm_floor: 2500,
+            fan_budget: 100.0,
+            throttle_budget_ms: 0,
+            adjust_interval_secs: 60,
+            rate_window_secs: 16,
+            persist_interval_secs: 300,
+        }
+    }
+}
+
+impl Config {
+    fn load() -> Self {
+        match fs::read_to_string(CONFIG_FILE) {
+            Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
+                log("config", &format!("Bad config ({e}), using defaults"));
+                Self::default()
+            }),
+            Err(_) => Self::default(),
+        }
+    }
+
+    fn save_default() {
+        if let Some(dir) = std::path::Path::new(CONFIG_FILE).parent() {
+            let _ = fs::create_dir_all(dir);
+        }
+        if !std::path::Path::new(CONFIG_FILE).exists() {
+            if let Ok(json) = serde_json::to_string_pretty(&Self::default()) {
+                let _ = fs::write(CONFIG_FILE, &json);
+                log("config", &format!("Wrote defaults to {CONFIG_FILE}"));
+            }
+        }
+    }
+
+    // --- unit conversions (config is MHz, internals are kHz) ---
+
+    fn kp_khz(&self) -> f64 {
+        self.kp * 1000.0
+    }
+    fn kd_khz(&self) -> f64 {
+        self.kd * 1000.0
+    }
+    fn max_ramp_khz(&self) -> i64 {
+        self.max_ramp as i64 * 1000
+    }
+    fn min_cap_khz(&self) -> u64 {
+        self.min_cap as u64 * 1000
+    }
+    fn max_cap_khz(&self) -> u64 {
+        self.max_cap as u64 * 1000
+    }
+    fn ceiling_khz(&self, profile: Profile) -> u64 {
+        let mhz = match profile {
+            Profile::PowerSaver => self.ps_ceiling,
+            Profile::Balanced => self.bal_ceiling,
+            Profile::Performance => self.perf_ceiling,
+        };
+        mhz as u64 * 1000
+    }
+    fn adjust_interval(&self) -> Duration {
+        Duration::from_secs(self.adjust_interval_secs)
+    }
+    fn rate_window(&self) -> Duration {
+        Duration::from_secs(self.rate_window_secs)
+    }
+    fn persist_interval(&self) -> Duration {
+        Duration::from_secs(self.persist_interval_secs)
+    }
+}
 
 // =============================================================================
 // Profile
@@ -75,14 +171,6 @@ impl Profile {
             Self::PowerSaver => "power",
             Self::Balanced => "balance_power",
             Self::Performance => "performance",
-        }
-    }
-
-    fn ceiling(self) -> u64 {
-        match self {
-            Self::PowerSaver => 3_500_000,
-            Self::Balanced => 4_500_000,
-            Self::Performance => 4_500_000,
         }
     }
 }
@@ -213,7 +301,7 @@ impl TempHistory {
 }
 
 // =============================================================================
-// Window statistics (60s constraint tracking)
+// Window statistics (constraint tracking over adjust interval)
 // =============================================================================
 
 struct WindowStats {
@@ -258,18 +346,11 @@ fn cpu_temp() -> i32 {
         .unwrap_or(0)
 }
 
-fn fan_rpm_floor() -> u32 {
-    std::env::var("FAN_RPM_FLOOR")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(2500)
-}
-
-fn fan_rpm() -> u32 {
+fn fan_rpm(floor: u32) -> u32 {
     let f1 = read_sysfs_i64(FAN1_SENSOR).unwrap_or(0) as u32;
     let f2 = read_sysfs_i64(FAN2_SENSOR).unwrap_or(0) as u32;
     let max = f1.max(f2);
-    if max >= 60_000 || max < fan_rpm_floor() { 0 } else { max }
+    if max >= 60_000 || max < floor { 0 } else { max }
 }
 
 fn read_throttle_time_ms() -> u64 {
@@ -369,31 +450,29 @@ fn poll_interval(temp: i32, target: i32, rate: f64) -> Duration {
 }
 
 // =============================================================================
-// Target adjustment (every 60s)
+// Target adjustment
 // =============================================================================
 
-fn adjust_target(profile: Profile, window: &WindowStats, state: &mut State, target: i32, temp: i32) {
-    let fan_budget: f64 = std::env::var("FAN_BUDGET")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_FAN_BUDGET);
-    let throttle_budget: u64 = std::env::var("THROTTLE_BUDGET_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_THROTTLE_BUDGET_MS);
-
+fn adjust_target(
+    profile: Profile,
+    window: &WindowStats,
+    state: &mut State,
+    cfg: &Config,
+    target: i32,
+    temp: i32,
+) {
     let near_target = temp >= target - 3;
 
     match profile {
         Profile::PowerSaver => {
             let rot = window.fan_rotations;
-            if rot > fan_budget {
+            if rot > cfg.fan_budget {
                 state.power_saver_target -= 1;
                 log(
                     "target",
                     &format!(
-                        "PS: fan_rot={rot:.0} > budget={fan_budget} → target={}°C",
-                        state.power_saver_target
+                        "PS: fan_rot={rot:.0} > budget={} → target={}°C",
+                        cfg.fan_budget, state.power_saver_target
                     ),
                 );
             } else if rot < 0.01 && near_target {
@@ -409,21 +488,21 @@ fn adjust_target(profile: Profile, window: &WindowStats, state: &mut State, targ
                 log(
                     "target",
                     &format!(
-                        "PS: fan_rot={rot:.0} budget={fan_budget} temp={temp}°C → hold {}°C",
-                        state.power_saver_target
+                        "PS: fan_rot={rot:.0} budget={} temp={temp}°C → hold {}°C",
+                        cfg.fan_budget, state.power_saver_target
                     ),
                 );
             }
         }
         Profile::Performance => {
             let thr = window.throttle_delta_ms();
-            if thr > throttle_budget {
+            if thr > cfg.throttle_budget_ms {
                 state.performance_target -= 1;
                 log(
                     "target",
                     &format!(
-                        "Perf: throttle={thr}ms > budget={throttle_budget} → target={}°C",
-                        state.performance_target
+                        "Perf: throttle={thr}ms > budget={} → target={}°C",
+                        cfg.throttle_budget_ms, state.performance_target
                     ),
                 );
             } else if thr == 0 && near_target {
@@ -439,8 +518,8 @@ fn adjust_target(profile: Profile, window: &WindowStats, state: &mut State, targ
                 log(
                     "target",
                     &format!(
-                        "Perf: throttle={thr}ms budget={throttle_budget} temp={temp}°C → hold {}°C",
-                        state.performance_target
+                        "Perf: throttle={thr}ms budget={} temp={temp}°C → hold {}°C",
+                        cfg.throttle_budget_ms, state.performance_target
                     ),
                 );
             }
@@ -469,9 +548,11 @@ fn governor(profile: Profile, state: &mut State, stop: &AtomicBool) {
         return;
     }
 
+    let mut cfg = Config::load();
+
     apply_base(&dirs, 400_000, profile.epp(), 1);
 
-    let ceiling = profile.ceiling();
+    let ceiling = cfg.ceiling_khz(profile);
     let mut cap = ceiling;
     set_max_freq(&dirs, cap);
 
@@ -486,28 +567,44 @@ fn governor(profile: Profile, state: &mut State, stop: &AtomicBool) {
         ),
     );
 
-    let mut temp_history = TempHistory::new(RATE_WINDOW);
+    let mut temp_history = TempHistory::new(cfg.rate_window());
     let mut window = WindowStats::new();
     let mut last_persist = Instant::now();
     let mut last_poll = Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
+        // Hot-reload config
+        let new_cfg = Config::load();
+        if new_cfg != cfg {
+            log(
+                "config",
+                &format!(
+                    "Reloaded: {}",
+                    serde_json::to_string(&new_cfg).unwrap_or_default()
+                ),
+            );
+            temp_history.window = new_cfg.rate_window();
+            cfg = new_cfg;
+        }
+
         let poll_secs = last_poll.elapsed().as_secs_f64();
         last_poll = Instant::now();
 
         let temp = cpu_temp();
-        let rpm = fan_rpm();
+        let rpm = fan_rpm(cfg.fan_rpm_floor);
         temp_history.push(temp);
         window.add_fan_sample(rpm, poll_secs);
 
+        let ceiling = cfg.ceiling_khz(profile);
         let target = state.target(profile);
         let rate = temp_history.rate();
         let error = target as f64 - temp as f64;
 
-        let adjustment = (error * KP + rate * KD) as i64;
-        let adjustment = adjustment.min(MAX_RAMP); // limit ramp-up, uncapped step-down
+        let adjustment = (error * cfg.kp_khz() + rate * cfg.kd_khz()) as i64;
+        let adjustment = adjustment.min(cfg.max_ramp_khz());
 
-        let new_cap = (cap as i64 + adjustment).clamp(MIN_CAP as i64, ceiling as i64) as u64;
+        let new_cap =
+            (cap as i64 + adjustment).clamp(cfg.min_cap_khz() as i64, ceiling as i64) as u64;
 
         if new_cap != cap {
             set_max_freq(&dirs, new_cap);
@@ -523,12 +620,12 @@ fn governor(profile: Profile, state: &mut State, stop: &AtomicBool) {
             cap = new_cap;
         }
 
-        if window.elapsed() >= ADJUST_INTERVAL {
-            adjust_target(profile, &window, state, target, temp);
+        if window.elapsed() >= cfg.adjust_interval() {
+            adjust_target(profile, &window, state, &cfg, target, temp);
             window = WindowStats::new();
         }
 
-        if last_persist.elapsed() >= PERSIST_INTERVAL {
+        if last_persist.elapsed() >= cfg.persist_interval() {
             state.save();
             last_persist = Instant::now();
         }
@@ -594,6 +691,8 @@ fn watch_dbus(tx: mpsc::Sender<Profile>) {
 // =============================================================================
 
 fn main() {
+    let cfg = Config::load();
+    Config::save_default();
     let state = State::load();
 
     eprintln!("================================================");
@@ -601,28 +700,37 @@ fn main() {
     eprintln!("  PD thermal controller for ThinkPad X1");
     eprintln!("================================================");
     eprintln!(
-        "  Power Saver  │ EPP=power        │ target={}°C",
-        state.power_saver_target
+        "  Power Saver  │ EPP=power        │ target={}°C  ceil={}MHz",
+        state.power_saver_target, cfg.ps_ceiling
     );
     eprintln!(
-        "  Balanced     │ EPP=balance_power│ target={}°C",
-        state.target(Profile::Balanced)
+        "  Balanced     │ EPP=balance_power│ target={}°C  ceil={}MHz",
+        state.target(Profile::Balanced),
+        cfg.bal_ceiling
     );
     eprintln!(
-        "  Performance  │ EPP=performance  │ target={}°C",
-        state.performance_target
+        "  Performance  │ EPP=performance  │ target={}°C  ceil={}MHz",
+        state.performance_target, cfg.perf_ceiling
     );
     eprintln!("────────────────────────────────────────────────");
     eprintln!(
-        "  KP={:.0} KD={:.0} MAX_RAMP={}kHz",
-        KP, KD, MAX_RAMP / 1000
+        "  KP={} KD={} MAX_RAMP={}MHz",
+        cfg.kp, cfg.kd, cfg.max_ramp
     );
     eprintln!(
-        "  Adjust: every {}s  Persist: every {}s",
-        ADJUST_INTERVAL.as_secs(),
-        PERSIST_INTERVAL.as_secs()
+        "  Fan floor={}rpm budget={} rot/win",
+        cfg.fan_rpm_floor, cfg.fan_budget
     );
-    eprintln!("  State: {STATE_FILE}");
+    eprintln!(
+        "  Throttle budget={}ms/win",
+        cfg.throttle_budget_ms
+    );
+    eprintln!(
+        "  Adjust: {}s  Rate window: {}s  Persist: {}s",
+        cfg.adjust_interval_secs, cfg.rate_window_secs, cfg.persist_interval_secs
+    );
+    eprintln!("  Config: {CONFIG_FILE}  (hot-reload)");
+    eprintln!("  State:  {STATE_FILE}");
     eprintln!("================================================\n");
 
     let mut state = state;
@@ -637,7 +745,7 @@ fn main() {
             "Initial: {} ({}°C, fan {} rpm)",
             initial.name(),
             cpu_temp(),
-            fan_rpm(),
+            fan_rpm(cfg.fan_rpm_floor),
         ),
     );
 
@@ -671,17 +779,16 @@ fn main() {
         let new_profile = loop {
             match rx.recv_timeout(Duration::from_secs(1)) {
                 Ok(p) if p != current => break Some(p),
-                Ok(_) => {} // same profile, ignore
+                Ok(_) => {}
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if !running.load(Ordering::Relaxed) {
-                        break None; // shutdown
+                        break None;
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break None,
             }
         };
 
-        // Stop governor
         stop.store(true, Ordering::Relaxed);
         if let Ok(s) = handle.join() {
             state = s;
@@ -692,9 +799,10 @@ fn main() {
                 current = p;
             }
             None => {
+                let cfg = Config::load();
                 log("main", "Shutting down");
                 state.save();
-                set_max_freq(&dirs, MAX_CAP);
+                set_max_freq(&dirs, cfg.max_cap_khz());
                 apply_base(&dirs, 400_000, "balance_power", 0);
                 log("main", "Reset to defaults. Goodbye.");
                 return;
