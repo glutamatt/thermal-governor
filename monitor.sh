@@ -26,7 +26,7 @@ THR_BASE=$(cat "$THROTTLE" 2>/dev/null || echo 0)
 read_int()  { cat "$1" 2>/dev/null || echo 0; }
 read_temp() { echo $(( $(read_int "$TEMP_SENSOR") / 1000 )); }
 
-FAN_RPM_FLOOR=2500  # must match src/main.rs
+FAN_RPM_FLOOR=${FAN_RPM_FLOOR:-2500}  # override via env to match governor
 
 read_fan() {
     local v; v=$(read_int "$1")

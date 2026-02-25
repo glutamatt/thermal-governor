@@ -258,13 +258,18 @@ fn cpu_temp() -> i32 {
         .unwrap_or(0)
 }
 
-const FAN_RPM_FLOOR: u32 = 2500; // below this = inaudible coast-down, treat as 0
+fn fan_rpm_floor() -> u32 {
+    std::env::var("FAN_RPM_FLOOR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2500)
+}
 
 fn fan_rpm() -> u32 {
     let f1 = read_sysfs_i64(FAN1_SENSOR).unwrap_or(0) as u32;
     let f2 = read_sysfs_i64(FAN2_SENSOR).unwrap_or(0) as u32;
     let max = f1.max(f2);
-    if max >= 60_000 || max < FAN_RPM_FLOOR { 0 } else { max }
+    if max >= 60_000 || max < fan_rpm_floor() { 0 } else { max }
 }
 
 fn read_throttle_time_ms() -> u64 {
