@@ -8,10 +8,16 @@ repository = "https://github.com/glutamatt/thermal-governor"
 keywords = ["thermal", "cpu", "governor", "thinkpad", "linux"]
 categories = ["hardware-support"]
 
+[[bin]]
+name = "hw-tui"
+path = "src/bin/hw_tui.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 signal-hook = "0.3"
+ratatui = "0.29"
+crossterm = "0.28"
 
 [profile.release]
 opt-level = "s"

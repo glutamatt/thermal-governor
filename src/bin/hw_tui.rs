@@ -1,0 +1,1131 @@
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use ratatui::{
+    Frame, Terminal,
+    backend::CrosstermBackend,
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    symbols,
+    text::{Line, Span},
+    widgets::{
+        Axis, Block, BorderType, Borders, Chart, Dataset, GraphType, Paragraph, Wrap,
+    },
+};
+use std::collections::VecDeque;
+use std::fs::{self, File};
+use std::io::{self, BufWriter, Stdout, Write as IoWrite};
+use std::path::PathBuf;
+use std::process::{Child, Command};
+use std::time::{Duration, Instant};
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+const TEMP_SENSOR: &str = "/sys/class/thermal/thermal_zone8/temp";
+const FAN1_SENSOR: &str = "/sys/class/hwmon/hwmon7/fan1_input";
+const FAN2_SENSOR: &str = "/sys/class/hwmon/hwmon7/fan2_input";
+const THROTTLE_PATH: &str =
+    "/sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_total_time_ms";
+const EPP_PATH: &str = "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference";
+const RAPL_PKG_PATH: &str = "/sys/class/powercap/intel-rapl:0/energy_uj";
+const FAN_CTRL: &str = "/proc/acpi/ibm/fan";
+const FAN_LEVELS: &[&str] = &["0", "1", "2", "3", "4", "5", "6", "7", "disengaged"];
+
+const HISTORY_CAP: usize = 300; // 5 minutes at 1Hz
+
+const STRESS_LEVELS: &[u32] = &[0, 1, 2, 4, 8, 16];
+const FREQ_CAPS: &[u32] = &[1200, 1500, 2000, 2500, 3000, 3500, 4000, 4500];
+const EPP_VALUES: &[&str] = &["power", "balance_power", "balance_performance", "performance", "default"];
+
+// =============================================================================
+// TimeSeries
+// =============================================================================
+
+struct TimeSeries {
+    data: VecDeque<(f64, f64)>,
+}
+
+impl TimeSeries {
+    fn new() -> Self {
+        Self {
+            data: VecDeque::with_capacity(HISTORY_CAP + 1),
+        }
+    }
+
+    fn push(&mut self, elapsed: f64, value: f64) {
+        self.data.push_back((elapsed, value));
+        if self.data.len() > HISTORY_CAP {
+            self.data.pop_front();
+        }
+    }
+
+    fn as_vec(&self) -> Vec<(f64, f64)> {
+        self.data.iter().copied().collect()
+    }
+
+    fn y_bounds(&self, default_min: f64, default_max: f64, padding: f64) -> [f64; 2] {
+        if self.data.is_empty() {
+            return [default_min, default_max];
+        }
+        let mut lo = f64::MAX;
+        let mut hi = f64::MIN;
+        for &(_, v) in &self.data {
+            if v < lo {
+                lo = v;
+            }
+            if v > hi {
+                hi = v;
+            }
+        }
+        lo = (lo - padding).max(default_min);
+        hi = (hi + padding).max(lo + 1.0);
+        [lo, hi]
+    }
+
+    fn x_bounds(&self) -> [f64; 2] {
+        if self.data.is_empty() {
+            return [0.0, 300.0];
+        }
+        let last = self.data.back().unwrap().0;
+        let first = (last - 300.0).max(0.0);
+        [first, last]
+    }
+}
+
+// =============================================================================
+// Hardware I/O
+// =============================================================================
+
+fn read_sysfs_i64(path: &str) -> Option<i64> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn read_sysfs_str(path: &str) -> String {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+fn read_temp() -> f64 {
+    read_sysfs_i64(TEMP_SENSOR).unwrap_or(0) as f64 / 1000.0
+}
+
+fn read_fan_max() -> (u32, u32) {
+    let f1 = read_sysfs_i64(FAN1_SENSOR).unwrap_or(0) as u32;
+    let f2 = read_sysfs_i64(FAN2_SENSOR).unwrap_or(0) as u32;
+    let f1 = if f1 >= 60_000 { 0 } else { f1 };
+    let f2 = if f2 >= 60_000 { 0 } else { f2 };
+    (f1, f2)
+}
+
+fn read_throttle_ms() -> u64 {
+    read_sysfs_i64(THROTTLE_PATH).unwrap_or(0) as u64
+}
+
+fn read_epp() -> String {
+    read_sysfs_str(EPP_PATH)
+}
+
+fn read_energy_uj() -> u64 {
+    read_sysfs_i64(RAPL_PKG_PATH).unwrap_or(0) as u64
+}
+
+fn read_cpu_usage() -> (u64, u64) {
+    let content = fs::read_to_string("/proc/stat").unwrap_or_default();
+    let first = content.lines().next().unwrap_or("");
+    let fields: Vec<u64> = first
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    let total: u64 = fields.iter().sum();
+    let idle = fields.get(3).copied().unwrap_or(0) + fields.get(4).copied().unwrap_or(0);
+    (idle, total)
+}
+
+fn set_epp(dirs: &[PathBuf], epp: &str) {
+    for d in dirs {
+        let _ = fs::write(d.join("energy_performance_preference"), epp);
+    }
+}
+
+fn set_fan_level(level: &str) {
+    let _ = fs::write(FAN_CTRL, format!("level {level}"));
+}
+
+fn set_fan_auto() {
+    let _ = fs::write(FAN_CTRL, "level auto");
+}
+
+fn cpufreq_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(entries) = fs::read_dir("/sys/devices/system/cpu/") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let s = name.to_string_lossy().to_string();
+            if s.starts_with("cpu") && s.len() > 3 && s.as_bytes()[3].is_ascii_digit() {
+                let p = entry.path().join("cpufreq");
+                if p.is_dir() {
+                    dirs.push(p);
+                }
+            }
+        }
+    }
+    dirs.sort();
+    dirs
+}
+
+fn set_freq_cap(dirs: &[PathBuf], mhz: u32) {
+    let khz = (mhz as u64 * 1000).to_string();
+    for d in dirs {
+        let _ = fs::write(d.join("scaling_max_freq"), &khz);
+    }
+}
+
+
+// =============================================================================
+// App
+// =============================================================================
+
+struct App {
+    temp: TimeSeries,
+    fan: TimeSeries,
+    throttle_rate: TimeSeries,
+    cpu_usage: TimeSeries,
+    power: TimeSeries,
+    freq_min: TimeSeries,
+    freq_avg: TimeSeries,
+    freq_max: TimeSeries,
+
+    stress_idx: usize,
+    cap_idx: usize,
+    epp_idx: usize,
+    fan_level_idx: usize,
+    fan_auto: bool,
+    stress_children: Vec<Child>,
+
+    recording: bool,
+    rec_start: Option<Instant>,
+    csv_writer: Option<BufWriter<File>>,
+    csv_path: Option<String>,
+
+    prev_throttle_ms: u64,
+    prev_throttle_time: Instant,
+    prev_energy_uj: u64,
+    prev_energy_time: Instant,
+    prev_cpu_idle: u64,
+    prev_cpu_total: u64,
+    cpufreq_dirs: Vec<PathBuf>,
+
+    events: VecDeque<String>,
+    start: Instant,
+    last_sample: Instant,
+    should_quit: bool,
+
+    cur_temp: f64,
+    cur_fan: u32,
+    cur_fan1: u32,
+    cur_fan2: u32,
+    cur_freq: u32,
+    cur_epp: String,
+    cur_throttle_rate: f64,
+    cur_cpu: f64,
+    cur_power_w: f64,
+    cur_freq_min: u32,
+    cur_freq_avg: u32,
+    cur_freq_max: u32,
+}
+
+impl App {
+    fn new() -> Self {
+        let dirs = cpufreq_dirs();
+        let (idle, total) = read_cpu_usage();
+        let now = Instant::now();
+        let thr = read_throttle_ms();
+        let energy = read_energy_uj();
+        let epp = read_epp();
+        let cap_idx = FREQ_CAPS.len() - 1; // start at max
+
+        // detect current EPP index
+        let epp_idx = EPP_VALUES
+            .iter()
+            .position(|&e| e == epp)
+            .unwrap_or(0);
+
+        Self {
+            temp: TimeSeries::new(),
+            fan: TimeSeries::new(),
+            throttle_rate: TimeSeries::new(),
+            cpu_usage: TimeSeries::new(),
+            power: TimeSeries::new(),
+            freq_min: TimeSeries::new(),
+            freq_avg: TimeSeries::new(),
+            freq_max: TimeSeries::new(),
+
+            stress_idx: 0,
+            cap_idx,
+            epp_idx,
+            fan_level_idx: 4,
+            fan_auto: true,
+            stress_children: Vec::new(),
+
+            recording: false,
+            rec_start: None,
+            csv_writer: None,
+            csv_path: None,
+
+            prev_throttle_ms: thr,
+            prev_throttle_time: now,
+            prev_energy_uj: energy,
+            prev_energy_time: now,
+            prev_cpu_idle: idle,
+            prev_cpu_total: total,
+            cpufreq_dirs: dirs,
+
+            events: VecDeque::with_capacity(10),
+            start: now,
+            last_sample: now - Duration::from_secs(2),
+            should_quit: false,
+
+            cur_temp: 0.0,
+            cur_fan: 0,
+            cur_fan1: 0,
+            cur_fan2: 0,
+            cur_freq: 0,
+            cur_epp: epp,
+            cur_throttle_rate: 0.0,
+            cur_cpu: 0.0,
+            cur_power_w: 0.0,
+            cur_freq_min: 0,
+            cur_freq_avg: 0,
+            cur_freq_max: 0,
+        }
+    }
+
+    fn log_event(&mut self, msg: String) {
+        self.events.push_back(msg);
+        if self.events.len() > 6 {
+            self.events.pop_front();
+        }
+    }
+
+    fn sample(&mut self) {
+        let elapsed = self.start.elapsed().as_secs_f64();
+
+        // Temperature
+        let temp = read_temp();
+        self.temp.push(elapsed, temp);
+        self.cur_temp = temp;
+
+        // Fan
+        let (f1, f2) = read_fan_max();
+        let fan = f1.max(f2);
+        self.fan.push(elapsed, fan as f64);
+        self.cur_fan = fan;
+        self.cur_fan1 = f1;
+        self.cur_fan2 = f2;
+
+        // Throttle rate
+        let thr_now = read_throttle_ms();
+        let dt = self.prev_throttle_time.elapsed().as_secs_f64();
+        let rate = if dt > 0.0 {
+            (thr_now.saturating_sub(self.prev_throttle_ms)) as f64 / dt
+        } else {
+            0.0
+        };
+        self.throttle_rate.push(elapsed, rate);
+        self.cur_throttle_rate = rate;
+        self.prev_throttle_ms = thr_now;
+        self.prev_throttle_time = Instant::now();
+
+        // CPU usage
+        let (idle, total) = read_cpu_usage();
+        let d_idle = idle.saturating_sub(self.prev_cpu_idle) as f64;
+        let d_total = total.saturating_sub(self.prev_cpu_total) as f64;
+        let usage = if d_total > 0.0 {
+            100.0 * (1.0 - d_idle / d_total)
+        } else {
+            0.0
+        };
+        self.cpu_usage.push(elapsed, usage);
+        self.cur_cpu = usage;
+        self.prev_cpu_idle = idle;
+        self.prev_cpu_total = total;
+
+        // Power (RAPL)
+        let energy = read_energy_uj();
+        let energy_dt = self.prev_energy_time.elapsed().as_secs_f64();
+        if energy_dt > 0.0 && energy > self.prev_energy_uj {
+            let watts = (energy - self.prev_energy_uj) as f64 / (energy_dt * 1_000_000.0);
+            self.power.push(elapsed, watts);
+            self.cur_power_w = watts;
+        }
+        self.prev_energy_uj = energy;
+        self.prev_energy_time = Instant::now();
+
+        // Freq (all cores: min/avg/max) + EPP
+        let mut fmin = u32::MAX;
+        let mut fmax = 0u32;
+        let mut fsum = 0u64;
+        let mut fcount = 0u32;
+        for d in &self.cpufreq_dirs {
+            let p = d.join("scaling_cur_freq");
+            if let Some(khz) = read_sysfs_i64(p.to_str().unwrap_or("")) {
+                let mhz = (khz / 1000) as u32;
+                if mhz < fmin {
+                    fmin = mhz;
+                }
+                if mhz > fmax {
+                    fmax = mhz;
+                }
+                fsum += mhz as u64;
+                fcount += 1;
+            }
+        }
+        let favg = if fcount > 0 {
+            (fsum / fcount as u64) as u32
+        } else {
+            0
+        };
+        if fmin == u32::MAX {
+            fmin = 0;
+        }
+        self.freq_min.push(elapsed, fmin as f64);
+        self.freq_avg.push(elapsed, favg as f64);
+        self.freq_max.push(elapsed, fmax as f64);
+        self.cur_freq = favg;
+        self.cur_freq_min = fmin;
+        self.cur_freq_avg = favg;
+        self.cur_freq_max = fmax;
+        self.cur_epp = read_epp();
+
+        // CSV
+        if self.recording {
+            if let Some(ref mut w) = self.csv_writer {
+                let ts = chrono_now();
+                let rec_elapsed = self
+                    .rec_start
+                    .map(|s| s.elapsed().as_secs_f64())
+                    .unwrap_or(0.0);
+                let _ = writeln!(
+                    w,
+                    "{},{:.1},{:.0},{},{},{},{},{:.1},{:.1},{},{},{},{},{:.1},{},{}",
+                    ts,
+                    rec_elapsed,
+                    temp,
+                    f1,
+                    f2,
+                    fan,
+                    thr_now,
+                    rate,
+                    usage,
+                    self.cur_freq_min,
+                    self.cur_freq_avg,
+                    self.cur_freq_max,
+                    FREQ_CAPS[self.cap_idx],
+                    self.cur_power_w,
+                    self.cur_epp,
+                    STRESS_LEVELS[self.stress_idx],
+                );
+                let _ = w.flush();
+            }
+        }
+
+        self.last_sample = Instant::now();
+    }
+
+    fn set_stress(&mut self, idx: usize) {
+        // kill existing
+        for mut c in self.stress_children.drain(..) {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        self.stress_idx = idx;
+        let cores = STRESS_LEVELS[idx];
+        if cores > 0 {
+            match Command::new("stress-ng")
+                .args(["--cpu", &cores.to_string(), "--quiet"])
+                .spawn()
+            {
+                Ok(child) => self.stress_children.push(child),
+                Err(e) => self.log_event(format!("❌ stress-ng error: {e}")),
+            }
+        }
+        self.log_event(format!(
+            "🏋️ Stress → {}",
+            if cores == 0 {
+                "idle 😴".to_string()
+            } else {
+                format!("{cores} cores")
+            }
+        ));
+    }
+
+    fn set_cap(&mut self, idx: usize) {
+        self.cap_idx = idx;
+        let mhz = FREQ_CAPS[idx];
+        set_freq_cap(&self.cpufreq_dirs, mhz);
+        self.log_event(format!("📏 Freq cap → {mhz} MHz"));
+    }
+
+    fn cycle_epp(&mut self) {
+        self.epp_idx = (self.epp_idx + 1) % EPP_VALUES.len();
+        let epp = EPP_VALUES[self.epp_idx];
+        set_epp(&self.cpufreq_dirs, epp);
+        self.cur_epp = epp.to_string();
+        let emoji = match epp {
+            "power" => "🔋",
+            "balance_power" => "⚖️",
+            "balance_performance" => "⚡",
+            "performance" => "🚀",
+            "default" => "🔄",
+            _ => "❓",
+        };
+        self.log_event(format!("{emoji} EPP → {epp}"));
+    }
+
+    fn toggle_recording(&mut self) {
+        if self.recording {
+            self.csv_writer = None;
+            self.recording = false;
+            self.log_event("⏹️  Recording stopped".into());
+        } else {
+            let ts = chrono_now().replace(':', "-");
+            let path = format!("hw-tui-{ts}.csv");
+            match File::create(&path) {
+                Ok(f) => {
+                    let mut w = BufWriter::new(f);
+                    let _ = writeln!(w, "timestamp,elapsed_s,temp_c,fan1_rpm,fan2_rpm,fan_max_rpm,throttle_total_ms,throttle_rate_ms_s,cpu_usage_pct,freq_min_mhz,freq_avg_mhz,freq_max_mhz,cap_mhz,power_w,epp,stress_cores");
+                    self.csv_writer = Some(w);
+                    self.csv_path = Some(path.clone());
+                    self.rec_start = Some(Instant::now());
+                    self.recording = true;
+                    self.log_event(format!("🔴 Recording → {path}"));
+                }
+                Err(e) => self.log_event(format!("❌ CSV error: {e}")),
+            }
+        }
+    }
+
+    fn handle_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+            KeyCode::Up => {
+                let next = (self.stress_idx + 1).min(STRESS_LEVELS.len() - 1);
+                if next != self.stress_idx {
+                    self.set_stress(next);
+                }
+            }
+            KeyCode::Down => {
+                if self.stress_idx > 0 {
+                    let next = self.stress_idx - 1;
+                    self.set_stress(next);
+                }
+            }
+            KeyCode::Right => {
+                let next = (self.cap_idx + 1).min(FREQ_CAPS.len() - 1);
+                if next != self.cap_idx {
+                    self.set_cap(next);
+                }
+            }
+            KeyCode::Left => {
+                if self.cap_idx > 0 {
+                    let next = self.cap_idx - 1;
+                    self.set_cap(next);
+                }
+            }
+            KeyCode::Char('p') => self.cycle_epp(),
+            KeyCode::Char('r') => self.toggle_recording(),
+            KeyCode::Char('a') => self.toggle_fan_auto(),
+            KeyCode::Char('k') => self.fan_up(),
+            KeyCode::Char('j') => self.fan_down(),
+            _ => {}
+        }
+    }
+
+    fn toggle_fan_auto(&mut self) {
+        if self.fan_auto {
+            let level = FAN_LEVELS[self.fan_level_idx];
+            set_fan_level(level);
+            self.fan_auto = false;
+            self.log_event(format!("🌀 Fan → manual level {level}"));
+        } else {
+            set_fan_auto();
+            self.fan_auto = true;
+            self.log_event("🌀 Fan → auto (EC)".into());
+        }
+    }
+
+    fn fan_up(&mut self) {
+        let next = (self.fan_level_idx + 1).min(FAN_LEVELS.len() - 1);
+        if next != self.fan_level_idx {
+            self.fan_level_idx = next;
+            let level = FAN_LEVELS[next];
+            set_fan_level(level);
+            self.fan_auto = false;
+            self.log_event(format!("🌀 Fan → level {level}"));
+        }
+    }
+
+    fn fan_down(&mut self) {
+        if self.fan_level_idx > 0 {
+            self.fan_level_idx -= 1;
+            let level = FAN_LEVELS[self.fan_level_idx];
+            set_fan_level(level);
+            self.fan_auto = false;
+            self.log_event(format!("🌀 Fan → level {level}"));
+        }
+    }
+
+    fn cleanup(&mut self) {
+        for mut c in self.stress_children.drain(..) {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        // Restore fan to auto
+        set_fan_auto();
+        // Restore cap to max
+        set_freq_cap(&self.cpufreq_dirs, 4500);
+    }
+}
+
+fn chrono_now() -> String {
+    // Simple timestamp without chrono dependency
+    let output = Command::new("date")
+        .arg("+%Y-%m-%dT%H:%M:%S")
+        .output()
+        .ok();
+    output
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+// =============================================================================
+// UI
+// =============================================================================
+
+fn draw(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),  // header
+            Constraint::Min(8),    // charts (fills remaining)
+            Constraint::Length(1), // status bar
+            Constraint::Length(4), // event log
+            Constraint::Length(1), // keybindings
+        ])
+        .split(area);
+
+    draw_header(frame, outer[0], app);
+    draw_charts(frame, outer[1], app);
+    draw_status(frame, outer[2], app);
+    draw_events(frame, outer[3], app);
+    draw_help(frame, outer[4], app);
+}
+
+fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
+    let mut spans = vec![
+        Span::styled(" 🌡️  HW THERMAL MONITOR ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+    ];
+
+    if app.recording {
+        let elapsed = app.rec_start.map(|s| s.elapsed().as_secs()).unwrap_or(0);
+        let mm = elapsed / 60;
+        let ss = elapsed % 60;
+        spans.push(Span::styled(
+            format!(" 🔴 REC {mm}:{ss:02} "),
+            Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw("  "));
+    }
+
+    let epp_emoji = match app.cur_epp.as_str() {
+        "power" => "🔋",
+        "balance_power" => "⚖️",
+        "balance_performance" => "⚡",
+        "performance" => "🚀",
+        "default" => "🔄",
+        _ => "❓",
+    };
+    spans.push(Span::styled(
+        format!("{epp_emoji} epp: {}", app.cur_epp),
+        Style::default().fg(Color::Yellow),
+    ));
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn draw_charts(frame: &mut Frame, area: Rect, app: &App) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+
+    let top = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(33),
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+        ])
+        .split(rows[0]);
+
+    let bot = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(33),
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+        ])
+        .split(rows[1]);
+
+    let temp_emoji = if app.cur_temp >= 85.0 {
+        "🔥"
+    } else if app.cur_temp >= 70.0 {
+        "🌡️"
+    } else {
+        "❄️"
+    };
+    draw_chart(
+        frame,
+        top[0],
+        &format!(" {temp_emoji} Temp  {:.0}°C ", app.cur_temp),
+        &app.temp,
+        Color::Yellow,
+        30.0,
+        110.0,
+        5.0,
+    );
+
+    let fan_emoji = if app.cur_fan >= 4000 {
+        "🌪️"
+    } else if app.cur_fan > 0 {
+        "💨"
+    } else {
+        "🤫"
+    };
+    draw_chart(
+        frame,
+        top[1],
+        &format!(" {fan_emoji} Fan  {} RPM ", app.cur_fan),
+        &app.fan,
+        Color::Cyan,
+        0.0,
+        7000.0,
+        200.0,
+    );
+
+    let pwr_emoji = if app.cur_power_w >= 30.0 {
+        "🔌"
+    } else if app.cur_power_w >= 10.0 {
+        "⚡"
+    } else {
+        "🔋"
+    };
+    draw_chart(
+        frame,
+        top[2],
+        &format!(" {pwr_emoji} Power  {:.1}W ", app.cur_power_w),
+        &app.power,
+        Color::Magenta,
+        0.0,
+        80.0,
+        3.0,
+    );
+
+    let thr_emoji = if app.cur_throttle_rate > 0.0 { "⚠️" } else { "✅" };
+    draw_chart(
+        frame,
+        bot[0],
+        &format!(" {thr_emoji} Throttle  {:.1} ms/s ", app.cur_throttle_rate),
+        &app.throttle_rate,
+        Color::Red,
+        0.0,
+        10.0,
+        1.0,
+    );
+
+    let cpu_emoji = if app.cur_cpu >= 80.0 {
+        "🏋️"
+    } else if app.cur_cpu >= 30.0 {
+        "⚙️"
+    } else {
+        "😴"
+    };
+    draw_chart(
+        frame,
+        bot[1],
+        &format!(" {cpu_emoji} CPU Usage  {:.0}% ", app.cur_cpu),
+        &app.cpu_usage,
+        Color::Green,
+        0.0,
+        100.0,
+        5.0,
+    );
+
+    draw_freq_chart(frame, bot[2], app);
+}
+
+fn draw_chart(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    series: &TimeSeries,
+    color: Color,
+    y_min: f64,
+    y_max: f64,
+    y_pad: f64,
+) {
+    let data = series.as_vec();
+    let y_bounds = series.y_bounds(y_min, y_max, y_pad);
+    let x_bounds = series.x_bounds();
+
+    // x-axis labels: time ago
+    let range = x_bounds[1] - x_bounds[0];
+    let ago = if range > 0.0 {
+        let m = (range / 60.0) as u32;
+        let s = (range % 60.0) as u32;
+        format!("-{m}:{s:02}")
+    } else {
+        "-0:00".into()
+    };
+
+    let dataset = Dataset::default()
+        .data(&data)
+        .graph_type(GraphType::Line)
+        .marker(symbols::Marker::Braille)
+        .style(Style::default().fg(color));
+
+    let chart = Chart::new(vec![dataset])
+        .block(
+            Block::default()
+                .title(Span::styled(title, Style::default().fg(color).add_modifier(Modifier::BOLD)))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(color)),
+        )
+        .x_axis(
+            Axis::default()
+                .bounds(x_bounds)
+                .labels(vec![Line::from(ago), Line::from("now")])
+                .style(Style::default().fg(Color::DarkGray)),
+        )
+        .y_axis(
+            Axis::default()
+                .bounds(y_bounds)
+                .labels(vec![
+                    Line::from(format!("{:.0}", y_bounds[0])),
+                    Line::from(format!("{:.0}", y_bounds[1])),
+                ])
+                .style(Style::default().fg(Color::DarkGray)),
+        );
+
+    frame.render_widget(chart, area);
+}
+
+fn draw_freq_chart(frame: &mut Frame, area: Rect, app: &App) {
+    let data_min = app.freq_min.as_vec();
+    let data_avg = app.freq_avg.as_vec();
+    let data_max = app.freq_max.as_vec();
+
+    // Compute y bounds across all three series
+    let y_lo = app
+        .freq_min
+        .y_bounds(0.0, 5000.0, 100.0)[0]
+        .min(app.freq_avg.y_bounds(0.0, 5000.0, 100.0)[0]);
+    let y_hi = app
+        .freq_max
+        .y_bounds(0.0, 5000.0, 100.0)[1]
+        .max(app.freq_avg.y_bounds(0.0, 5000.0, 100.0)[1]);
+    let y_bounds = [y_lo, y_hi.max(y_lo + 100.0)];
+    let x_bounds = app.freq_avg.x_bounds();
+
+    let range = x_bounds[1] - x_bounds[0];
+    let ago = if range > 0.0 {
+        let m = (range / 60.0) as u32;
+        let s = (range % 60.0) as u32;
+        format!("-{m}:{s:02}")
+    } else {
+        "-0:00".into()
+    };
+
+    let ds_max = Dataset::default()
+        .data(&data_max)
+        .graph_type(GraphType::Line)
+        .marker(symbols::Marker::Braille)
+        .style(Style::default().fg(Color::Red));
+
+    let ds_avg = Dataset::default()
+        .data(&data_avg)
+        .graph_type(GraphType::Line)
+        .marker(symbols::Marker::Braille)
+        .style(Style::default().fg(Color::Yellow));
+
+    let ds_min = Dataset::default()
+        .data(&data_min)
+        .graph_type(GraphType::Line)
+        .marker(symbols::Marker::Braille)
+        .style(Style::default().fg(Color::Cyan));
+
+    let mid_label = Line::from(vec![
+        Span::styled("min:", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{}", app.cur_freq_min), Style::default().fg(Color::Cyan)),
+        Span::styled(" avg:", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{}", app.cur_freq_avg), Style::default().fg(Color::Yellow)),
+        Span::styled(" max:", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{}", app.cur_freq_max), Style::default().fg(Color::Red)),
+    ]);
+
+    let chart = Chart::new(vec![ds_max, ds_avg, ds_min])
+        .block(
+            Block::default()
+                .title(Span::styled(
+                    " 📊 Freq MHz ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .x_axis(
+            Axis::default()
+                .bounds(x_bounds)
+                .labels(vec![Line::from(ago), mid_label, Line::from("now")])
+                .style(Style::default().fg(Color::DarkGray)),
+        )
+        .y_axis(
+            Axis::default()
+                .bounds(y_bounds)
+                .labels(vec![
+                    Line::from(format!("{:.0}", y_bounds[0])),
+                    Line::from(format!("{:.0}", y_bounds[1])),
+                ])
+                .style(Style::default().fg(Color::DarkGray)),
+        );
+
+    frame.render_widget(chart, area);
+}
+
+fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
+    let stress_label = if STRESS_LEVELS[app.stress_idx] == 0 {
+        "idle".to_string()
+    } else {
+        format!("{}c", STRESS_LEVELS[app.stress_idx])
+    };
+
+    let temp_color = if app.cur_temp >= 85.0 {
+        Color::Red
+    } else if app.cur_temp >= 70.0 {
+        Color::Yellow
+    } else {
+        Color::Green
+    };
+
+    let fan_color = if app.cur_fan >= 4000 {
+        Color::Red
+    } else if app.cur_fan > 0 {
+        Color::Yellow
+    } else {
+        Color::Green
+    };
+
+    let spans = vec![
+        Span::raw("  🏋️ Stress: "),
+        Span::styled(&stress_label, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::raw("   📏 Cap: "),
+        Span::styled(
+            format!("{} MHz", FREQ_CAPS[app.cap_idx]),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   📊 Freq: "),
+        Span::styled(
+            format!("{}", app.cur_freq_min),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::styled("/", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{}", app.cur_freq_avg),
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::styled("/", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{} MHz", app.cur_freq_max),
+            Style::default().fg(Color::Red),
+        ),
+        Span::raw("   🌡️ "),
+        Span::styled(
+            format!("{:.0}°C", app.cur_temp),
+            Style::default().fg(temp_color).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   💨 "),
+        Span::styled(
+            format!("{}", app.cur_fan),
+            Style::default().fg(fan_color),
+        ),
+        Span::raw(" ("),
+        Span::styled(format!("{}", app.cur_fan1), Style::default().fg(Color::DarkGray)),
+        Span::raw("/"),
+        Span::styled(format!("{}", app.cur_fan2), Style::default().fg(Color::DarkGray)),
+        Span::raw(")"),
+        Span::raw("   🌀 "),
+        Span::styled(
+            if app.fan_auto {
+                "auto".to_string()
+            } else {
+                format!("lvl {}", FAN_LEVELS[app.fan_level_idx])
+            },
+            Style::default().fg(if app.fan_auto { Color::Green } else { Color::Yellow }).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   🔌 "),
+        Span::styled(
+            format!("{:.1}W", app.cur_power_w),
+            Style::default().fg(Color::Magenta),
+        ),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::DarkGray).fg(Color::White)),
+        area,
+    );
+}
+
+fn draw_events(frame: &mut Frame, area: Rect, app: &App) {
+    let lines: Vec<Line> = app
+        .events
+        .iter()
+        .map(|e| {
+            Line::from(vec![
+                Span::styled(" > ", Style::default().fg(Color::DarkGray)),
+                Span::styled(e.as_str(), Style::default().fg(Color::White)),
+            ])
+        })
+        .collect();
+
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .border_type(BorderType::Rounded);
+
+    frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: true }), area);
+}
+
+fn draw_help(frame: &mut Frame, area: Rect, _app: &App) {
+    let help = Line::from(vec![
+        Span::styled(" 🏋️ [", Style::default().fg(Color::DarkGray)),
+        Span::styled("↑↓", Style::default().fg(Color::Cyan)),
+        Span::styled("] stress   📏 [", Style::default().fg(Color::DarkGray)),
+        Span::styled("←→", Style::default().fg(Color::Cyan)),
+        Span::styled("] freq cap   ⚡ [", Style::default().fg(Color::DarkGray)),
+        Span::styled("p", Style::default().fg(Color::Cyan)),
+        Span::styled("] epp   🌀 [", Style::default().fg(Color::DarkGray)),
+        Span::styled("jk", Style::default().fg(Color::Cyan)),
+        Span::styled("] fan [", Style::default().fg(Color::DarkGray)),
+        Span::styled("a", Style::default().fg(Color::Cyan)),
+        Span::styled("] auto   💾 [", Style::default().fg(Color::DarkGray)),
+        Span::styled("r", Style::default().fg(Color::Cyan)),
+        Span::styled("] record   👋 [", Style::default().fg(Color::DarkGray)),
+        Span::styled("q", Style::default().fg(Color::Cyan)),
+        Span::styled("] quit", Style::default().fg(Color::DarkGray)),
+    ]);
+
+    frame.render_widget(
+        Paragraph::new(help).alignment(Alignment::Center),
+        area,
+    );
+}
+
+// =============================================================================
+// Terminal
+// =============================================================================
+
+fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    Terminal::new(backend)
+}
+
+fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    Ok(())
+}
+
+// =============================================================================
+// Main
+// =============================================================================
+
+fn fan_control_enabled() -> bool {
+    fs::read_to_string("/sys/module/thinkpad_acpi/parameters/fan_control")
+        .unwrap_or_default()
+        .trim()
+        == "Y"
+}
+
+fn main() -> io::Result<()> {
+    let mut terminal = setup_terminal()?;
+    let mut app = App::new();
+
+    if fan_control_enabled() {
+        app.log_event("🌀 Fan control enabled".into());
+    } else {
+        app.log_event("⚠️ Fan control disabled — run: sudo modprobe -r thinkpad_acpi && sudo modprobe thinkpad_acpi fan_control=1".into());
+    }
+    app.log_event(format!(
+        "🚀 Started!  EPP: {}  Cap: {} MHz",
+        app.cur_epp,
+        FREQ_CAPS[app.cap_idx]
+    ));
+
+    // Initial sample
+    app.sample();
+
+    loop {
+        // Handle input
+        if event::poll(Duration::from_millis(50))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    app.handle_key(key.code);
+                }
+            }
+        }
+
+        // Sample at 1Hz
+        if app.last_sample.elapsed() >= Duration::from_secs(1) {
+            app.sample();
+        }
+
+        // Draw
+        terminal.draw(|frame| draw(frame, &app))?;
+
+        if app.should_quit {
+            break;
+        }
+    }
+
+    app.cleanup();
+    restore_terminal(&mut terminal)?;
+
+    println!("Freq cap restored to 4500 MHz. Stress killed.");
+    if let Some(path) = &app.csv_path {
+        if app.recording {
+            println!("Recording saved: {path}");
+        }
+    }
+
+    Ok(())
+}
