@@ -877,24 +877,21 @@ fn draw_freq_chart(frame: &mut Frame, area: Rect, app: &App) {
         .marker(symbols::Marker::Braille)
         .style(Style::default().fg(Color::Cyan));
 
-    let mid_label = Line::from(vec![
+    let title = Line::from(vec![
+        Span::styled(" Freq MHz ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         Span::styled("min:", Style::default().fg(Color::DarkGray)),
         Span::styled(format!("{}", app.cur_freq_min), Style::default().fg(Color::Cyan)),
         Span::styled(" avg:", Style::default().fg(Color::DarkGray)),
         Span::styled(format!("{}", app.cur_freq_avg), Style::default().fg(Color::Yellow)),
         Span::styled(" max:", Style::default().fg(Color::DarkGray)),
         Span::styled(format!("{}", app.cur_freq_max), Style::default().fg(Color::Red)),
+        Span::styled(" ", Style::default()),
     ]);
 
     let chart = Chart::new(vec![ds_max, ds_avg, ds_min])
         .block(
             Block::default()
-                .title(Span::styled(
-                    " 📊 Freq MHz ",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ))
+                .title(title)
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(Color::Yellow)),
@@ -902,7 +899,7 @@ fn draw_freq_chart(frame: &mut Frame, area: Rect, app: &App) {
         .x_axis(
             Axis::default()
                 .bounds(x_bounds)
-                .labels(vec![Line::from(ago), mid_label, Line::from("now")])
+                .labels(vec![Line::from(ago), Line::from("now")])
                 .style(Style::default().fg(Color::DarkGray)),
         )
         .y_axis(
