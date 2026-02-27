@@ -610,10 +610,6 @@ impl App {
             let _ = c.kill();
             let _ = c.wait();
         }
-        // Restore fan to auto
-        set_fan_auto();
-        // Restore cap to max
-        set_freq_cap(&self.cpufreq_dirs, 4500);
     }
 }
 
@@ -1236,7 +1232,7 @@ fn main() -> io::Result<()> {
     app.cleanup();
     restore_terminal(&mut terminal)?;
 
-    println!("Freq cap restored to 4500 MHz. Stress killed.");
+    println!("Exited. Settings left unchanged.");
     if let Some(path) = &app.csv_path {
         if app.recording {
             println!("Recording saved: {path}");
