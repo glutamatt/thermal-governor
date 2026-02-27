@@ -1080,10 +1080,23 @@ fn main() -> io::Result<()> {
     let mut terminal = setup_terminal()?;
     let mut app = App::new();
 
-    if fan_control_enabled() {
-        app.log_event("🌀 Fan control enabled".into());
+    if !fan_control_enabled() {
+        // Reload thinkpad_acpi with fan_control=1 (requires root)
+        app.log_event("🌀 Enabling fan control (reloading thinkpad_acpi)...".into());
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg("modprobe -r thinkpad_acpi && modprobe thinkpad_acpi fan_control=1")
+            .status();
+        match status {
+            Ok(s) if s.success() && fan_control_enabled() => {
+                app.log_event("🌀 Fan control enabled".into());
+            }
+            _ => {
+                app.log_event("⚠️ Cannot enable fan control — run as root".into());
+            }
+        }
     } else {
-        app.log_event("⚠️ Fan control disabled — run: sudo modprobe -r thinkpad_acpi && sudo modprobe thinkpad_acpi fan_control=1".into());
+        app.log_event("🌀 Fan control enabled".into());
     }
     app.log_event(format!(
         "🚀 Started!  EPP: {}  Cap: {} MHz",
