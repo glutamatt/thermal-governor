@@ -135,6 +135,15 @@ fn read_energy_uj() -> u64 {
     read_sysfs_i64(RAPL_PKG_PATH).unwrap_or(0) as u64
 }
 
+fn read_battery_power_w() -> Option<f64> {
+    let status = read_sysfs_str("/sys/class/power_supply/BAT0/status");
+    if status != "Discharging" {
+        return None;
+    }
+    let uw = read_sysfs_i64("/sys/class/power_supply/BAT0/power_now")?;
+    Some(uw as f64 / 1_000_000.0)
+}
+
 fn read_cpu_usage() -> (u64, u64) {
     let content = fs::read_to_string("/proc/stat").unwrap_or_default();
     let first = content.lines().next().unwrap_or("");
@@ -198,6 +207,8 @@ struct App {
     throttle_rate: TimeSeries,
     cpu_usage: TimeSeries,
     power: TimeSeries,
+    sys_power: TimeSeries,
+    rest_power: TimeSeries,
     freq_min: TimeSeries,
     freq_avg: TimeSeries,
     freq_max: TimeSeries,
@@ -236,6 +247,7 @@ struct App {
     cur_throttle_rate: f64,
     cur_cpu: f64,
     cur_power_w: f64,
+    cur_sys_power_w: Option<f64>,
     cur_freq_min: u32,
     cur_freq_avg: u32,
     cur_freq_max: u32,
@@ -263,6 +275,8 @@ impl App {
             throttle_rate: TimeSeries::new(),
             cpu_usage: TimeSeries::new(),
             power: TimeSeries::new(),
+            sys_power: TimeSeries::new(),
+            rest_power: TimeSeries::new(),
             freq_min: TimeSeries::new(),
             freq_avg: TimeSeries::new(),
             freq_max: TimeSeries::new(),
@@ -301,6 +315,7 @@ impl App {
             cur_throttle_rate: 0.0,
             cur_cpu: 0.0,
             cur_power_w: 0.0,
+            cur_sys_power_w: None,
             cur_freq_min: 0,
             cur_freq_avg: 0,
             cur_freq_max: 0,
@@ -367,6 +382,14 @@ impl App {
         }
         self.prev_energy_uj = energy;
         self.prev_energy_time = Instant::now();
+
+        // System power (battery)
+        self.cur_sys_power_w = read_battery_power_w();
+        if let Some(sys_w) = self.cur_sys_power_w {
+            self.sys_power.push(elapsed, sys_w);
+            let rest = (sys_w - self.cur_power_w).max(0.0);
+            self.rest_power.push(elapsed, rest);
+        }
 
         // Freq (all cores: min/avg/max) + EPP
         let mut fmin = u32::MAX;
@@ -725,23 +748,7 @@ fn draw_charts(frame: &mut Frame, area: Rect, app: &App) {
         200.0,
     );
 
-    let pwr_emoji = if app.cur_power_w >= 30.0 {
-        "🔌"
-    } else if app.cur_power_w >= 10.0 {
-        "⚡"
-    } else {
-        "🔋"
-    };
-    draw_chart(
-        frame,
-        top[2],
-        &format!(" {pwr_emoji} Power  {:.1}W ", app.cur_power_w),
-        &app.power,
-        Color::Magenta,
-        0.0,
-        80.0,
-        3.0,
-    );
+    draw_power_chart(frame, top[2], app);
 
     let thr_emoji = if app.cur_throttle_rate > 0.0 { "⚠️" } else { "✅" };
     draw_chart(
@@ -813,6 +820,105 @@ fn draw_chart(
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(color)),
+        )
+        .x_axis(
+            Axis::default()
+                .bounds(x_bounds)
+                .labels(vec![Line::from(ago), Line::from("now")])
+                .style(Style::default().fg(Color::DarkGray)),
+        )
+        .y_axis(
+            Axis::default()
+                .bounds(y_bounds)
+                .labels(vec![
+                    Line::from(format!("{:.0}", y_bounds[0])),
+                    Line::from(format!("{:.0}", y_bounds[1])),
+                ])
+                .style(Style::default().fg(Color::DarkGray)),
+        );
+
+    frame.render_widget(chart, area);
+}
+
+fn draw_power_chart(frame: &mut Frame, area: Rect, app: &App) {
+    let data_rapl = app.power.as_vec();
+    let data_sys = app.sys_power.as_vec();
+    let data_rest = app.rest_power.as_vec();
+
+    let on_battery = app.cur_sys_power_w.is_some();
+
+    // Y bounds: use sys_power if on battery, otherwise just RAPL
+    let y_lo = 0.0;
+    let y_hi = if on_battery {
+        app.sys_power
+            .y_bounds(0.0, 80.0, 3.0)[1]
+            .max(app.power.y_bounds(0.0, 80.0, 3.0)[1])
+    } else {
+        app.power.y_bounds(0.0, 80.0, 3.0)[1]
+    };
+    let y_bounds = [y_lo, y_hi.max(1.0)];
+    let x_bounds = app.power.x_bounds();
+
+    let range = x_bounds[1] - x_bounds[0];
+    let ago = if range > 0.0 {
+        let m = (range / 60.0) as u32;
+        let s = (range % 60.0) as u32;
+        format!("-{m}:{s:02}")
+    } else {
+        "-0:00".into()
+    };
+
+    let mut datasets = Vec::new();
+
+    if on_battery {
+        datasets.push(
+            Dataset::default()
+                .data(&data_sys)
+                .graph_type(GraphType::Line)
+                .marker(symbols::Marker::Braille)
+                .style(Style::default().fg(Color::Red)),
+        );
+        datasets.push(
+            Dataset::default()
+                .data(&data_rest)
+                .graph_type(GraphType::Line)
+                .marker(symbols::Marker::Braille)
+                .style(Style::default().fg(Color::DarkGray)),
+        );
+    }
+
+    datasets.push(
+        Dataset::default()
+            .data(&data_rapl)
+            .graph_type(GraphType::Line)
+            .marker(symbols::Marker::Braille)
+            .style(Style::default().fg(Color::Magenta)),
+    );
+
+    // Title with current values
+    let mut title_spans = vec![
+        Span::styled(" Power ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        Span::styled("cpu:", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{:.1}W", app.cur_power_w), Style::default().fg(Color::Magenta)),
+    ];
+    if let Some(sys_w) = app.cur_sys_power_w {
+        let rest = (sys_w - app.cur_power_w).max(0.0);
+        title_spans.push(Span::styled(" rest:", Style::default().fg(Color::DarkGray)));
+        title_spans.push(Span::styled(format!("{:.1}W", rest), Style::default().fg(Color::Red)));
+        title_spans.push(Span::styled(" total:", Style::default().fg(Color::DarkGray)));
+        title_spans.push(Span::styled(format!("{:.1}W", sys_w), Style::default().fg(Color::Red)));
+    } else {
+        title_spans.push(Span::styled(" (AC)", Style::default().fg(Color::DarkGray)));
+    }
+    title_spans.push(Span::styled(" ", Style::default()));
+
+    let chart = Chart::new(datasets)
+        .block(
+            Block::default()
+                .title(Line::from(title_spans))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Magenta)),
         )
         .x_axis(
             Axis::default()
