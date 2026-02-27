@@ -38,7 +38,7 @@ const FAN_LEVELS: &[&str] = &["0", "1", "2", "3", "4", "5", "6", "7", "disengage
 const HISTORY_CAP: usize = 300; // 5 minutes at 1Hz
 
 const STRESS_LEVELS: &[u32] = &[0, 1, 2, 4, 8, 16];
-const FREQ_CAPS: &[u32] = &[1200, 1500, 2000, 2500, 3000, 3500, 4000, 4500];
+const FREQ_CAPS: &[u32] = &[2000, 2250, 2500, 2750, 3000, 3250, 3500, 3750, 4000, 4250, 4500];
 const EPP_VALUES: &[&str] = &["power", "balance_power", "balance_performance", "performance", "default"];
 
 // =============================================================================
