@@ -38,7 +38,7 @@ const FAN_LEVELS: &[&str] = &["0", "1", "2", "3", "4", "5", "6", "7", "disengage
 const HISTORY_CAP: usize = 300; // 5 minutes at 1Hz
 
 const STRESS_LEVELS: &[u32] = &[0, 1, 2, 4, 8, 16];
-const FREQ_CAPS: &[u32] = &[2000, 2250, 2500, 2750, 3000, 3250, 3500, 3750, 4000, 4250, 4500];
+const FREQ_CAPS: &[u32] = &[2000, 2200, 2400, 2600, 2800, 3000, 3200, 3400, 3600, 3800, 4000, 4200, 4400, 4500];
 const EPP_VALUES: &[&str] = &["power", "balance_power", "balance_performance", "performance", "default"];
 
 // =============================================================================
@@ -538,18 +538,8 @@ impl App {
     fn handle_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
-            KeyCode::Up => {
-                let next = (self.stress_idx + 1).min(STRESS_LEVELS.len() - 1);
-                if next != self.stress_idx {
-                    self.set_stress(next);
-                }
-            }
-            KeyCode::Down => {
-                if self.stress_idx > 0 {
-                    let next = self.stress_idx - 1;
-                    self.set_stress(next);
-                }
-            }
+            KeyCode::Up => self.fan_up(),
+            KeyCode::Down => self.fan_down(),
             KeyCode::Right => {
                 let next = (self.cap_idx + 1).min(FREQ_CAPS.len() - 1);
                 if next != self.cap_idx {
@@ -565,8 +555,18 @@ impl App {
             KeyCode::Char('p') => self.cycle_epp(),
             KeyCode::Char('r') => self.toggle_recording(),
             KeyCode::Char('a') => self.toggle_fan_auto(),
-            KeyCode::Char('k') => self.fan_up(),
-            KeyCode::Char('j') => self.fan_down(),
+            KeyCode::Char('k') => {
+                let next = (self.stress_idx + 1).min(STRESS_LEVELS.len() - 1);
+                if next != self.stress_idx {
+                    self.set_stress(next);
+                }
+            }
+            KeyCode::Char('j') => {
+                if self.stress_idx > 0 {
+                    let next = self.stress_idx - 1;
+                    self.set_stress(next);
+                }
+            }
             _ => {}
         }
     }
@@ -1126,17 +1126,17 @@ fn draw_events(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_help(frame: &mut Frame, area: Rect, _app: &App) {
     let help = Line::from(vec![
-        Span::styled(" 🏋️ [", Style::default().fg(Color::DarkGray)),
+        Span::styled(" 🌀 [", Style::default().fg(Color::DarkGray)),
         Span::styled("↑↓", Style::default().fg(Color::Cyan)),
-        Span::styled("] stress   📏 [", Style::default().fg(Color::DarkGray)),
+        Span::styled("] fan [", Style::default().fg(Color::DarkGray)),
+        Span::styled("a", Style::default().fg(Color::Cyan)),
+        Span::styled("] auto   📏 [", Style::default().fg(Color::DarkGray)),
         Span::styled("←→", Style::default().fg(Color::Cyan)),
         Span::styled("] freq cap   ⚡ [", Style::default().fg(Color::DarkGray)),
         Span::styled("p", Style::default().fg(Color::Cyan)),
-        Span::styled("] epp   🌀 [", Style::default().fg(Color::DarkGray)),
+        Span::styled("] epp   🏋️ [", Style::default().fg(Color::DarkGray)),
         Span::styled("jk", Style::default().fg(Color::Cyan)),
-        Span::styled("] fan [", Style::default().fg(Color::DarkGray)),
-        Span::styled("a", Style::default().fg(Color::Cyan)),
-        Span::styled("] auto   💾 [", Style::default().fg(Color::DarkGray)),
+        Span::styled("] stress   💾 [", Style::default().fg(Color::DarkGray)),
         Span::styled("r", Style::default().fg(Color::Cyan)),
         Span::styled("] record   👋 [", Style::default().fg(Color::DarkGray)),
         Span::styled("q", Style::default().fg(Color::Cyan)),

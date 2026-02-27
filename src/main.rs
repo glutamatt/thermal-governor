@@ -605,13 +605,8 @@ fn enable_fan_control() -> bool {
     }
 }
 
-fn read_rapl_power_w() -> f64 {
-    // RAPL package energy in microjoules — we compute delta per call
-    // For simplicity, read the instantaneous power from power_uw if available
-    let path = "/sys/class/powercap/intel-rapl:0/power_uw";
-    read_sysfs_i64(path)
-        .map(|uw| uw as f64 / 1_000_000.0)
-        .unwrap_or(0.0)
+fn read_rapl_energy_uj() -> u64 {
+    read_sysfs_i64("/sys/class/powercap/intel-rapl:0/energy_uj").unwrap_or(0) as u64
 }
 
 // =============================================================================
@@ -689,7 +684,9 @@ fn observer(stop: &AtomicBool) {
     let mut detector = EventDetector::new();
 
     let mut prev_throttle_ms = read_throttle_time_ms();
+    let mut prev_energy_uj = read_rapl_energy_uj();
     let mut prev_time = Instant::now();
+    let mut tick: u64 = 0;
 
     log("obs", "Observer loop started (1Hz sampling, 300-sample buffer)");
 
@@ -714,7 +711,9 @@ fn observer(stop: &AtomicBool) {
         let throttle_rate = (throttle_ms.saturating_sub(prev_throttle_ms)) as f64 / dt;
         prev_throttle_ms = throttle_ms;
 
-        let rapl = read_rapl_power_w();
+        let energy_uj = read_rapl_energy_uj();
+        let rapl = (energy_uj.wrapping_sub(prev_energy_uj)) as f64 / (dt * 1_000_000.0);
+        prev_energy_uj = energy_uj;
 
         let sample = Sample {
             timestamp: SystemTime::now(),
@@ -764,7 +763,8 @@ fn observer(stop: &AtomicBool) {
         }
 
         // --- Periodic status log (every 60s) ---
-        if buffer.len() % 60 == 0 {
+        tick += 1;
+        if tick % 60 == 0 {
             log(
                 "status",
                 &format!(
