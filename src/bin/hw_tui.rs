@@ -1176,6 +1176,16 @@ fn fan_control_enabled() -> bool {
 }
 
 fn main() -> io::Result<()> {
+    if unsafe { libc::geteuid() } != 0 {
+        let exe = std::env::current_exe().expect("cannot resolve own path");
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let mut cmd = Command::new("sudo");
+        cmd.arg(&exe);
+        cmd.args(&args);
+        let status = cmd.status().expect("failed to exec sudo");
+        std::process::exit(status.code().unwrap_or(1));
+    }
+
     let mut terminal = setup_terminal()?;
     let mut app = App::new();
 
