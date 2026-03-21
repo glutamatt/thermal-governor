@@ -26,8 +26,6 @@ use std::time::{Duration, Instant};
 // =============================================================================
 
 const TEMP_SENSOR: &str = "/sys/class/thermal/thermal_zone8/temp";
-const FAN1_SENSOR: &str = "/sys/class/hwmon/hwmon7/fan1_input";
-const FAN2_SENSOR: &str = "/sys/class/hwmon/hwmon7/fan2_input";
 const THROTTLE_PATH: &str =
     "/sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_total_time_ms";
 const EPP_PATH: &str = "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference";
@@ -100,6 +98,20 @@ impl TimeSeries {
 // Hardware I/O
 // =============================================================================
 
+fn find_hwmon_by_name(name: &str) -> Option<PathBuf> {
+    for entry in fs::read_dir("/sys/class/hwmon/").ok()? {
+        let entry = entry.ok()?;
+        let n = fs::read_to_string(entry.path().join("name"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if n == name {
+            return Some(entry.path());
+        }
+    }
+    None
+}
+
 fn read_sysfs_i64(path: &str) -> Option<i64> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
 }
@@ -115,9 +127,9 @@ fn read_temp() -> f64 {
     read_sysfs_i64(TEMP_SENSOR).unwrap_or(0) as f64 / 1000.0
 }
 
-fn read_fan_max() -> (u32, u32) {
-    let f1 = read_sysfs_i64(FAN1_SENSOR).unwrap_or(0) as u32;
-    let f2 = read_sysfs_i64(FAN2_SENSOR).unwrap_or(0) as u32;
+fn read_fan_rpms(thinkpad_hwmon: &str) -> (u32, u32) {
+    let f1 = read_sysfs_i64(&format!("{thinkpad_hwmon}/fan1_input")).unwrap_or(0) as u32;
+    let f2 = read_sysfs_i64(&format!("{thinkpad_hwmon}/fan2_input")).unwrap_or(0) as u32;
     let f1 = if f1 >= 60_000 { 0 } else { f1 };
     let f2 = if f2 >= 60_000 { 0 } else { f2 };
     (f1, f2)
@@ -232,6 +244,7 @@ struct App {
     prev_cpu_idle: u64,
     prev_cpu_total: u64,
     cpufreq_dirs: Vec<PathBuf>,
+    thinkpad_hwmon: String,
 
     events: VecDeque<String>,
     start: Instant,
@@ -256,6 +269,9 @@ struct App {
 impl App {
     fn new() -> Self {
         let dirs = cpufreq_dirs();
+        let thinkpad_hwmon = find_hwmon_by_name("thinkpad")
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "/sys/class/hwmon/hwmon5".to_string());
         let (idle, total) = read_cpu_usage();
         let now = Instant::now();
         let thr = read_throttle_ms();
@@ -300,6 +316,7 @@ impl App {
             prev_cpu_idle: idle,
             prev_cpu_total: total,
             cpufreq_dirs: dirs,
+            thinkpad_hwmon,
 
             events: VecDeque::with_capacity(10),
             start: now,
@@ -338,7 +355,7 @@ impl App {
         self.cur_temp = temp;
 
         // Fan
-        let (f1, f2) = read_fan_max();
+        let (f1, f2) = read_fan_rpms(&self.thinkpad_hwmon);
         let fan = f1.max(f2);
         self.fan.push(elapsed, fan as f64);
         self.cur_fan = fan;

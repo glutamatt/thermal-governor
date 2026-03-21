@@ -14,8 +14,7 @@ use std::time::{Duration, Instant, SystemTime};
 // =============================================================================
 
 const TEMP_SENSOR: &str = "/sys/class/thermal/thermal_zone8/temp";
-const FAN1_SENSOR: &str = "/sys/class/hwmon/hwmon7/fan1_input";
-const FAN2_SENSOR: &str = "/sys/class/hwmon/hwmon7/fan2_input";
+const THINKPAD_HWMON_NAME: &str = "thinkpad";
 const FAN_CONTROL: &str = "/proc/acpi/ibm/fan";
 const FAN_CONTROL_PARAM: &str = "/sys/module/thinkpad_acpi/parameters/fan_control";
 const THROTTLE_TIME_PATH: &str =
@@ -472,15 +471,29 @@ fn read_sysfs_string(path: impl AsRef<Path>) -> Option<String> {
     Some(fs::read_to_string(path).ok()?.trim().to_string())
 }
 
+fn find_hwmon_by_name(name: &str) -> Option<PathBuf> {
+    for entry in fs::read_dir("/sys/class/hwmon/").ok()? {
+        let entry = entry.ok()?;
+        let n = fs::read_to_string(entry.path().join("name"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if n == name {
+            return Some(entry.path());
+        }
+    }
+    None
+}
+
 fn cpu_temp() -> f64 {
     read_sysfs_i64(TEMP_SENSOR)
         .map(|t| t as f64 / 1000.0)
         .unwrap_or(0.0)
 }
 
-fn fan_rpms() -> (f64, f64) {
-    let f1 = read_sysfs_i64(FAN1_SENSOR).unwrap_or(0) as f64;
-    let f2 = read_sysfs_i64(FAN2_SENSOR).unwrap_or(0) as f64;
+fn fan_rpms(thinkpad_hwmon: &str) -> (f64, f64) {
+    let f1 = read_sysfs_i64(format!("{thinkpad_hwmon}/fan1_input")).unwrap_or(0) as f64;
+    let f2 = read_sysfs_i64(format!("{thinkpad_hwmon}/fan2_input")).unwrap_or(0) as f64;
     let clamp = |v: f64| if v >= 60000.0 { 0.0 } else { v };
     (clamp(f1), clamp(f2))
 }
@@ -666,6 +679,12 @@ fn observer(stop: &AtomicBool) {
         log("obs", "No cpufreq dirs found!");
         return;
     }
+    let thinkpad_hwmon = find_hwmon_by_name(THINKPAD_HWMON_NAME)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| {
+            log("obs", "WARNING: thinkpad hwmon not found, fan RPMs will be 0");
+            "/sys/class/hwmon/hwmon_missing".to_string()
+        });
 
     // Startup: ensure fan control, restore settings
     if !enable_fan_control() {
@@ -701,7 +720,7 @@ fn observer(stop: &AtomicBool) {
         let temp_rate = temp_history.rate();
 
         let load = cpu_usage.sample();
-        let (f1, f2) = fan_rpms();
+        let (f1, f2) = fan_rpms(&thinkpad_hwmon);
         let fan_level = read_fan_level();
         let (freq_min, freq_avg, freq_max) = read_cpu_freqs(&dirs);
         let freq_cap = read_freq_cap(&dirs);
