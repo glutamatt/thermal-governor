@@ -1,150 +1,81 @@
 # thermal-governor
 
-Dynamic auto-tuning thermal manager for Linux laptops with aggressive fan curves.
-
-Built for the ThinkPad X1 Carbon (Intel Core Ultra 7 155H) but adaptable to any laptop where the firmware fan curve is binary (off or max) and thermal throttling is harsh.
+Thermal management tooling for the ThinkPad X1 Carbon (Intel Core Ultra 7 155H). **Currently in a data-collection phase** — the daemon runs as a passive observer logging real-world thermal/load events, while manual tuning happens through an interactive companion (`hw-tui`). The goal is to feed that observation data back into a smarter auto-tuner.
 
 ## Problem
 
-Many thin laptops have an aggressive thermal management strategy:
+The X1 Carbon's firmware fan curve is essentially binary (off or near-max). With unrestricted frequency caps, the CPU boosts to 4.5 GHz, the package temperature shoots to 98 °C in seconds, the firmware hard-throttles to ~400 MHz, then the cycle restarts. The result is a **boost-crash oscillation** that delivers worse sustained throughput than a steady lower frequency — and a laptop that's noisy and uncomfortable to use.
 
-1. CPU boosts to max frequency (4.5 GHz)
-2. Temperature spikes to 98°C in seconds
-3. Firmware hard-throttles the CPU to ~400 MHz
-4. Temperature drops, CPU boosts again
-5. Repeat — creating a **boost-crash cycle** that gives worse sustained performance than a steady lower frequency
+The built-in GNOME power profiles set EPP (Energy Performance Preference) but never cap the maximum frequency, so they can't break the cycle.
 
-The built-in GNOME power profiles only set static EPP (Energy Performance Preference) values with no frequency capping, so they can't prevent this.
+## Project phases
 
-## Solution
+The first version was an **active controller**: it adjusted `scaling_max_freq` in a feedback loop, with predictive bias on temperature rate, per-profile thermal tables, hysteresis, cooldowns, and a self-tuner that nudged the tables over time based on observed fan activity. It worked, but the auto-tuner was operating on too little signal — it couldn't tell a workload spike apart from background noise, so its adjustments felt arbitrary and non-deterministic.
 
-`thermal-governor` replaces static CPU settings with a **dynamic feedback loop**:
+**Current phase — observation.** The daemon stopped deciding and started recording. It runs as a passive observer at 1 Hz, captures everything that matters around interesting thermal/load events, and persists the user's manual settings (via `hw-tui`) across reboots. The dataset accumulating in `/var/lib/thermal-governor/events/` is the input I want for the **next** iteration of auto-tuning — one that has enough labelled context (real workloads, real thermal responses, real user choices) to converge somewhere useful instead of drifting.
 
-- Reads CPU package temperature every 2 seconds (500ms when temp ≥ 80°C for faster spike response)
-- Adjusts `scaling_max_freq` based on per-profile thermal tables
-- Steps **down immediately** when temperature rises (multi-level jump), with **predictive bias** that uses temperature rate-of-change to trigger step-downs early
-- Steps **up gradually** (+200 MHz per poll) with hysteresis and cooldown to prevent oscillation
-- **Enforces monotonicity invariants** — frequency caps are always strictly decreasing with minimum 200 MHz spread between levels, and per-level floors prevent long-term cap collapse
-- **Auto-tunes** its own parameters based on observed behavior (fan activity, temperature trends)
-- **Persists learned parameters** across reboots — collapsed caps are repaired on startup
-- **Filters sensor errors** — bogus fan readings (e.g. 0xFFFF) are discarded
+So `hw-tui` is the control surface for now, and the daemon is both the safety net (settings stick across reboots) and the data recorder for what comes next.
 
-## Profiles
+## What it does now
 
-| Profile | EPP | Goal |
-|---|---|---|
-| **Performance** | `performance` | Maximum sustained performance without CPU throttling |
-| **Balanced** | `balance_power` | Best performance compromise between the two other profiles |
-| **Power Saver** | `power` | Maximum performance with as little fan activity as possible |
+Two binaries built from the same crate:
 
-Profile switching is automatic — the daemon listens to GNOME's power-profiles-daemon via D-Bus and reacts instantly when you switch profiles in Settings.
+### `thermal-governor` (daemon)
 
-## Test Results (ThinkPad X1, Intel Core Ultra 7 155H)
+- **Passive observer**: samples CPU temp, fan RPMs, scaling frequencies, EPP, load, throttle time, and RAPL energy at 1 Hz into a rolling 5-minute buffer.
+- **Settings persistence**: on startup, reads `/var/lib/thermal-governor/settings.json` and restores the user's chosen `fan_level`, `freq_cap_mhz`, and `epp`. On shutdown, reverts to safe defaults (`fan=auto`, `cap=2000 MHz`).
+- **Event log**: when something interesting happens — hardware throttle, temperature crossing 85/90/95 °C, rapid temperature rise, load transition, soft throttle — it dumps the rolling buffer as JSON to `/var/lib/thermal-governor/events/`. Useful post-mortem after a surprising thermal event.
+- **No control loop (yet)**. The daemon does not nudge the frequency cap or fan level on its own — those are the user's choice via `hw-tui` (or any tool that writes the same sysfs paths). The recorded events are the dataset for re-introducing automation later.
+- **Dynamic hwmon discovery**: locates the `thinkpad` hwmon node by name, so fan RPM reads stay correct across reboots even when the `/sys/class/hwmon/hwmonN` enumeration order changes.
 
-All tests run with 100% all-core load (16 threads) for 60 seconds:
+### `hw-tui` (interactive)
 
-| Profile | Sustained Freq | Max Temp | Avg Temp | Throughput | Result |
-|---|---|---|---|---|---|
-| **Performance** | 2.8–3.2 GHz | 97°C | 86°C | ~150 M/sec | No throttle crash |
-| **Balanced** | 3.5 GHz | 75°C | 64°C | ~80 M/sec | Under 80°C |
-| **Power Saver** (idle) | 1.9 GHz | 56°C | 55°C | — | 0 RPM fans |
-| **Power Saver** (load) | 1.2 GHz | 64°C | 60°C | ~40 M/sec | Capped at floor |
-
-### Before vs After (Performance mode, full load)
-
-| | Before | After |
-|---|---|---|
-| Behavior | 4.5→0.4→4.5 GHz oscillation | 3.2 GHz sustained |
-| Max temp | 101°C (hard throttle) | 97°C (no throttle) |
-| Throughput | Unstable, crash cycles | Stable ~150 M/sec |
-| Experience | Laptop nearly unusable | Smooth sustained load |
-
-## Auto-Tuning
-
-The governor learns from its own operation:
-
-- **Every 2 minutes**: analyzes a rolling window of temperature/fan samples
-- **Power Saver**: if fans stayed off under actual load (avg ≥ 48°C) → raises all caps by 100 MHz (finds the true fanless ceiling); if fans kicked on too much → lowers all caps; threshold[0] is floored at 48°C to stay above idle temp
-- **Performance**: if temperature never approached danger zone → raises all caps; if it got too hot → aggressively lowers top caps (lower caps protected by floors)
-- **Balanced**: raises all caps when there's headroom; lowers top caps when too hot
-- **Cap floors** prevent long-term collapse: the auto-tuner can lower caps toward per-level minimums but not below them (e.g. performance: 3.0/2.4/2.0/1.6 GHz)
-- **Every 5 minutes**: persists learned parameters to `/var/lib/thermal-governor/tuned-params.json`
-- Parameters survive reboots and improve over days of use
-- **Silent when idle**: tuner only logs when parameters actually change
+A TUI control surface to set the frequency cap, fan level, and EPP by hand while watching their effect live (temperature trend, fan RPM, package power, per-core frequency distribution). Auto-escalates to sudo when launched without root, and preserves the current sysfs state when you quit — closing the TUI does not reset your tuning, only the daemon's clean shutdown does.
 
 ## Architecture
 
 ```
-                     ┌────────────────────────┐
-                     │     dbus-monitor        │
-                     │  (profile change watch) │
-                     └──────────┬─────────────┘
-                                │ sends Profile via channel
-                                ▼
-┌──────────────────────────────────────────────────────┐
-│                    Main Thread                        │
-│  - Detects initial GNOME profile                     │
-│  - Spawns/kills governor on profile switch            │
-│  - Handles SIGTERM/SIGINT for clean shutdown          │
-└──────────────────────┬───────────────────────────────┘
-                       │ spawns
-                       ▼
-┌──────────────────────────────────────────────────────┐
-│               Governor Thread                         │
-│                                                       │
-│  every 2s (500ms when temp ≥ 80°C):                    │
-│    read temp (x86_pkg_temp) + fan RPM (thinkpad)      │
-│    compute target_cap from ThermalTable               │
-│    apply scaling_max_freq if changed                  │
-│    record stats for auto-tuner                        │
-│                                                       │
-│  every 120s: run auto_tune() → adjust ThermalTable   │
-│  every 300s: persist state to JSON                    │
-└──────────────────────────────────────────────────────┘
+                ┌──────────────────────────┐
+                │       hw-tui (manual)     │
+                │   freq cap / fan / EPP    │
+                └────────────┬─────────────┘
+                             │ writes sysfs
+                             ▼
+                   ┌─────────────────────┐
+   sysfs/procfs ◄──┤   kernel knobs       ├──► sysfs reads
+                   │ scaling_max_freq,    │      (samples)
+                   │ /proc/acpi/ibm/fan,  │
+                   │ energy_performance_  │
+                   │   preference         │
+                   └─────────┬───────────┘
+                             │
+                             ▼
+              ┌──────────────────────────────────┐
+              │       thermal-governor            │
+              │                                   │
+              │  1 Hz observer loop               │
+              │   ├── 5-min rolling sample buffer │
+              │   ├── detect threshold events     │
+              │   ├── dump buffer to events/ on   │
+              │   │   throttle / temp cross / …   │
+              │   └── restore settings.json @boot │
+              └──────────────────────────────────┘
 ```
 
-## Installation
-
-### Build
+## Install
 
 ```bash
 cargo build --release
+sudo ./install.sh
 ```
 
-### Install
+The installer copies `target/release/thermal-governor` to `/usr/local/bin/`, writes the systemd unit, and starts the service.
 
-```bash
-sudo cp target/release/thermal-governor /usr/local/bin/
-sudo mkdir -p /var/lib/thermal-governor
-```
+State directory: `/var/lib/thermal-governor/`
+- `settings.json` — user-chosen `fan_level`, `freq_cap_mhz`, `epp` (restored at boot)
+- `events/<timestamp>-<event>.json` — buffer dump for each detected event
 
-### Systemd Service
-
-Create `/etc/systemd/system/thermal-governor.service`:
-
-```ini
-[Unit]
-Description=Dynamic Auto-Tuning Thermal Governor
-After=multi-user.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/thermal-governor
-Restart=always
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now thermal-governor.service
-```
-
-### Monitor
+## Monitor
 
 ```bash
 journalctl -u thermal-governor -f
@@ -153,85 +84,35 @@ journalctl -u thermal-governor -f
 Example output:
 
 ```
-[19:10:02] [main] Initial: performance (58°C, fan 5769 rpm)
-[19:10:02] [performance] Governor started: EPP=performance cap=4.5GHz thresh=75/85/92/95°C hyst=5°C
-[19:10:24] [performance] 80°C fan:5769rpm ↓ 4.5→3.2 GHz
-[19:10:32] [performance] 61°C fan:5777rpm ↑ 3.2→3.4 GHz
-[19:10:36] [performance] 62°C fan:5774rpm ↑ 3.4→3.6 GHz
-[19:10:40] [performance] 65°C fan:5763rpm ↑ 3.6→3.8 GHz
-[19:10:44] [performance] 64°C fan:5771rpm ↑ 3.8→4.0 GHz
-[19:10:49] [performance] 65°C fan:5769rpm ↑ 4.0→4.2 GHz
+[10:14:25] [main] Initial: 56°C, fan=auto
+[10:14:25] [fan] fan_control=1 enabled
+[10:14:25] [obs] Restoring settings: { fan_level: "auto", freq_cap_mhz: 2000, epp: "power" }
+[10:14:25] [obs] Observer loop started (1 Hz sampling, 300-sample buffer)
+[10:18:42] [status] 53°C Δ-0.0°C/s load=3% fan=auto rpm=0/0 freq=400/1555/2000 cap=2000 epp=power rapl=5.9W
 ```
 
-## Configuration
+When an event triggers, the buffer is written to disk; nothing else changes.
 
-The default thermal tables are hardcoded for the ThinkPad X1 (Core Ultra 7 155H). To adapt for different hardware, modify the constants and defaults in `src/main.rs`:
+## Events captured
 
-- **Sensor paths**: `TEMP_SENSOR`, `FAN1_SENSOR`, `FAN2_SENSOR` — find yours with `ls /sys/class/hwmon/*/`
-- **Thermal tables**: `ThermalTable::power_saver()`, `::balanced()`, `::performance()` — adjust thresholds and caps for your laptop's thermal characteristics
-- **Timing**: `POLL_INTERVAL`, `TUNE_INTERVAL`, `PERSIST_INTERVAL`
-- **Bounds**: `MIN_CAP`, `MAX_CAP`, `FREQ_STEP`, `MIN_SPREAD`
+| Event              | Trigger                                                        |
+|--------------------|----------------------------------------------------------------|
+| `throttle`         | Hardware throttle counter incremented                          |
+| `temp-cross-85`    | CPU package temperature crossed 85 °C (rising)                 |
+| `temp-cross-90`    | …crossed 90 °C                                                 |
+| `temp-cross-95`    | …crossed 95 °C                                                 |
+| `rapid-temp-rise`  | Temperature rate of change exceeded threshold                  |
+| `load-transition-up` / `-down` | CPU load crossed activity threshold                |
+| `soft-throttle`    | Frequency capped well below the configured ceiling for a while |
 
-The auto-tuner will refine the tables from there, but good starting defaults help it converge faster.
-
-### Finding Your Sensor Paths
-
-```bash
-# Temperature sensors
-for z in /sys/class/thermal/thermal_zone*/; do
-    echo "$(basename $z): $(cat ${z}type) = $(($(cat ${z}temp)/1000))°C"
-done
-
-# Fan sensors
-for h in /sys/class/hwmon/hwmon*/; do
-    name=$(cat ${h}name 2>/dev/null)
-    fans=$(ls ${h}fan*_input 2>/dev/null)
-    [ -n "$fans" ] && echo "$h ($name): $fans"
-done
-```
-
-### Resetting Learned Parameters
-
-```bash
-sudo rm /var/lib/thermal-governor/tuned-params.json
-sudo systemctl restart thermal-governor
-```
-
-## How It Works
-
-### Step-Down (Immediate)
-
-When temperature exceeds a threshold, the governor immediately jumps to the corresponding frequency cap. Higher thresholds trigger lower caps. This is checked from hottest to coolest, so the most severe cap always wins.
-
-### Step-Up (Gradual)
-
-When temperature drops, the governor ramps up **+200 MHz per poll** toward the next level, gated by hysteresis (default 5°C for Performance/Balanced, 2°C for Power Saver). After any step-down, a **cooldown period** (6 seconds) prevents immediate step-up. After each step-up, a **1-poll pause** lets the thermal sensor stabilize before the next increase. This produces a smooth ramp that naturally settles at the thermally sustainable frequency.
-
-### Adaptive Polling
-
-The governor polls at 2-second intervals normally, but switches to **500ms** when temperature reaches 80°C or above. This allows faster reaction to thermal spikes that can occur between standard 2-second polls, reducing the chance of temperatures reaching critical levels (100°C+).
-
-### Predictive Thermal Bias
-
-The governor tracks the rate of temperature change between polls. When temperature is rising fast, half the delta is added to the effective temperature for threshold checks. For example, if temp jumped +16°C in one poll, thresholds are effectively lowered by 8°C, triggering preemptive step-downs before actually hitting the thermal wall.
-
-### Auto-Tuning
-
-Every 2 minutes, the tuner analyzes collected samples:
-
-- **Fan activity percentage**: how often fans were spinning (>100 RPM)
-- **Max/average temperature**: thermal headroom assessment
-- **Time at lowest cap**: how often the emergency floor was hit
-
-Based on these metrics, it nudges frequency caps up or down by 100 MHz steps. Headroom events raise **all** cap levels (not just the top), allowing collapsed lower caps to recover gradually. After every adjustment, `enforce_invariants()` guarantees caps remain monotonically decreasing with at least 200 MHz spread between adjacent levels, within per-profile ceilings (3.5 GHz for Power Saver, 4.5 GHz for others), and above per-level floors that prevent long-term collapse to `MIN_CAP`.
+Each event file contains the 5 minutes leading up to the trigger — temperature, fan RPM, per-core frequencies, EPP, load, RAPL energy — as a JSON array. Useful raw material when you want to understand *why* the laptop just sounded angry.
 
 ## Requirements
 
 - Linux with `intel_pstate` driver (active mode)
-- GNOME with `power-profiles-daemon` (for profile switching via D-Bus)
-- `dbus-monitor` available in PATH
-- `gdbus` available in PATH
-- Root privileges (writes to sysfs)
+- `thinkpad_acpi` module with `fan_control=1` (the daemon enables it via modprobe if needed)
+- Root (writes sysfs, enables fan control, reads `/proc/acpi/ibm/fan`)
+- The `intel_pstate` and `thinkpad_acpi` sysfs paths used here are specific to recent Intel ThinkPads — adapt the constants in `src/main.rs` for other hardware
 
 ## License
 
