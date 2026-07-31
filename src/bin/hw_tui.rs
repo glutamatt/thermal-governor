@@ -17,6 +17,7 @@ use ratatui::{
 use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Stdout, Write as IoWrite};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -25,7 +26,9 @@ use std::time::{Duration, Instant};
 // Constants
 // =============================================================================
 
-const TEMP_SENSOR: &str = "/sys/class/thermal/thermal_zone8/temp";
+// Zone numbering is not stable across boots/kernels — discover by type at startup
+const TEMP_ZONE_TYPE: &str = "x86_pkg_temp";
+const TEMP_SENSOR_FALLBACK: &str = "/sys/class/thermal/thermal_zone8/temp";
 const THROTTLE_PATH: &str =
     "/sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_total_time_ms";
 const EPP_PATH: &str = "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference";
@@ -123,8 +126,22 @@ fn read_sysfs_str(path: &str) -> String {
         .to_string()
 }
 
-fn read_temp() -> f64 {
-    read_sysfs_i64(TEMP_SENSOR).unwrap_or(0) as f64 / 1000.0
+fn find_thermal_zone_by_type(zone_type: &str) -> Option<String> {
+    for entry in fs::read_dir("/sys/class/thermal/").ok()? {
+        let entry = entry.ok()?;
+        if !entry.file_name().to_string_lossy().starts_with("thermal_zone") {
+            continue;
+        }
+        let t = fs::read_to_string(entry.path().join("type")).unwrap_or_default();
+        if t.trim() == zone_type {
+            return Some(entry.path().join("temp").to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
+fn read_temp(sensor: &str) -> f64 {
+    read_sysfs_i64(sensor).unwrap_or(0) as f64 / 1000.0
 }
 
 fn read_fan_rpms(thinkpad_hwmon: &str) -> (u32, u32) {
@@ -181,6 +198,22 @@ fn set_fan_level(level: &str) {
 
 fn set_fan_auto() {
     let _ = fs::write(FAN_CTRL, "level auto");
+}
+
+/// Current fan state from /proc/acpi/ibm/fan → (auto, level index)
+fn read_fan_state() -> (bool, usize) {
+    if let Ok(content) = fs::read_to_string(FAN_CTRL) {
+        for line in content.lines() {
+            if let Some(rest) = line.strip_prefix("level:") {
+                let lvl = rest.trim();
+                if let Some(pos) = FAN_LEVELS.iter().position(|&l| l == lvl) {
+                    return (false, pos);
+                }
+                break; // "auto" or unknown
+            }
+        }
+    }
+    (true, 4)
 }
 
 fn cpufreq_dirs() -> Vec<PathBuf> {
@@ -245,6 +278,7 @@ struct App {
     prev_cpu_total: u64,
     cpufreq_dirs: Vec<PathBuf>,
     thinkpad_hwmon: String,
+    temp_sensor: String,
 
     events: VecDeque<String>,
     start: Instant,
@@ -255,7 +289,6 @@ struct App {
     cur_fan: u32,
     cur_fan1: u32,
     cur_fan2: u32,
-    cur_freq: u32,
     cur_epp: String,
     cur_throttle_rate: f64,
     cur_cpu: f64,
@@ -271,13 +304,23 @@ impl App {
         let dirs = cpufreq_dirs();
         let thinkpad_hwmon = find_hwmon_by_name("thinkpad")
             .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| "/sys/class/hwmon/hwmon5".to_string());
+            .unwrap_or_else(|| "/sys/class/hwmon/hwmon_missing".to_string());
+        let temp_sensor = find_thermal_zone_by_type(TEMP_ZONE_TYPE)
+            .unwrap_or_else(|| TEMP_SENSOR_FALLBACK.to_string());
         let (idle, total) = read_cpu_usage();
         let now = Instant::now();
         let thr = read_throttle_ms();
         let energy = read_energy_uj();
         let epp = read_epp();
-        let cap_idx = FREQ_CAPS.len() - 1; // start at max
+
+        // Sync UI state with the actual hardware state — the tool doesn't
+        // reset on exit and the observer daemon restores settings at boot,
+        // so assuming defaults would mislabel the status bar and CSVs
+        let cap_idx = read_sysfs_i64("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq")
+            .map(|khz| (khz / 1000) as u32)
+            .and_then(|mhz| FREQ_CAPS.iter().position(|&c| c >= mhz))
+            .unwrap_or(FREQ_CAPS.len() - 1);
+        let (fan_auto, fan_level_idx) = read_fan_state();
 
         // detect current EPP index
         let epp_idx = EPP_VALUES
@@ -300,8 +343,8 @@ impl App {
             stress_idx: 0,
             cap_idx,
             epp_idx,
-            fan_level_idx: 4,
-            fan_auto: true,
+            fan_level_idx,
+            fan_auto,
             stress_children: Vec::new(),
 
             recording: false,
@@ -317,17 +360,17 @@ impl App {
             prev_cpu_total: total,
             cpufreq_dirs: dirs,
             thinkpad_hwmon,
+            temp_sensor,
 
             events: VecDeque::with_capacity(10),
             start: now,
-            last_sample: now - Duration::from_secs(2),
+            last_sample: now,
             should_quit: false,
 
             cur_temp: 0.0,
             cur_fan: 0,
             cur_fan1: 0,
             cur_fan2: 0,
-            cur_freq: 0,
             cur_epp: epp,
             cur_throttle_rate: 0.0,
             cur_cpu: 0.0,
@@ -350,7 +393,7 @@ impl App {
         let elapsed = self.start.elapsed().as_secs_f64();
 
         // Temperature
-        let temp = read_temp();
+        let temp = read_temp(&self.temp_sensor);
         self.temp.push(elapsed, temp);
         self.cur_temp = temp;
 
@@ -438,7 +481,6 @@ impl App {
         self.freq_min.push(elapsed, fmin as f64);
         self.freq_avg.push(elapsed, favg as f64);
         self.freq_max.push(elapsed, fmax as f64);
-        self.cur_freq = favg;
         self.cur_freq_min = fmin;
         self.cur_freq_avg = favg;
         self.cur_freq_max = fmax;
@@ -479,31 +521,45 @@ impl App {
         self.last_sample = Instant::now();
     }
 
-    fn set_stress(&mut self, idx: usize) {
-        // kill existing
+    fn stop_stress(&mut self) {
         for mut c in self.stress_children.drain(..) {
-            let _ = c.kill();
+            // SIGTERM (not kill()'s SIGKILL) so the stress-ng supervisor
+            // reaps its worker processes instead of orphaning them
+            unsafe {
+                libc::kill(c.id() as i32, libc::SIGTERM);
+            }
             let _ = c.wait();
         }
-        self.stress_idx = idx;
+    }
+
+    fn set_stress(&mut self, idx: usize) {
+        self.stop_stress();
         let cores = STRESS_LEVELS[idx];
-        if cores > 0 {
-            match Command::new("stress-ng")
-                .args(["--cpu", &cores.to_string(), "--quiet"])
-                .spawn()
-            {
-                Ok(child) => self.stress_children.push(child),
-                Err(e) => self.log_event(format!("❌ stress-ng error: {e}")),
+        if cores == 0 {
+            self.stress_idx = 0;
+            self.log_event("🏋️ Stress → idle 😴".to_string());
+            return;
+        }
+        let mut cmd = Command::new("stress-ng");
+        cmd.args(["--cpu", &cores.to_string(), "--quiet"]);
+        // die with the TUI even if it panics or is SIGKILLed
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                Ok(())
+            });
+        }
+        match cmd.spawn() {
+            Ok(child) => {
+                self.stress_children.push(child);
+                self.stress_idx = idx;
+                self.log_event(format!("🏋️ Stress → {cores} cores"));
+            }
+            Err(e) => {
+                self.stress_idx = 0;
+                self.log_event(format!("❌ stress-ng error: {e}"));
             }
         }
-        self.log_event(format!(
-            "🏋️ Stress → {}",
-            if cores == 0 {
-                "idle 😴".to_string()
-            } else {
-                format!("{cores} cores")
-            }
-        ));
     }
 
     fn set_cap(&mut self, idx: usize) {
@@ -623,10 +679,7 @@ impl App {
     }
 
     fn cleanup(&mut self) {
-        for mut c in self.stress_children.drain(..) {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
+        self.stop_stress();
     }
 }
 
@@ -1203,26 +1256,45 @@ fn main() -> io::Result<()> {
         std::process::exit(status.code().unwrap_or(1));
     }
 
-    let mut terminal = setup_terminal()?;
-    let mut app = App::new();
-
+    // Enable fan control BEFORE App::new(): reloading thinkpad_acpi
+    // re-registers the hwmon device under a new number, which would
+    // invalidate an already-discovered path
+    let mut startup_events: Vec<String> = Vec::new();
     if !fan_control_enabled() {
-        // Reload thinkpad_acpi with fan_control=1 (requires root)
-        app.log_event("🌀 Enabling fan control (reloading thinkpad_acpi)...".into());
-        let status = Command::new("sh")
+        startup_events.push("🌀 Enabling fan control (reloading thinkpad_acpi)...".into());
+        let out = Command::new("sh")
             .arg("-c")
             .arg("modprobe -r thinkpad_acpi && modprobe thinkpad_acpi fan_control=1")
-            .status();
-        match status {
-            Ok(s) if s.success() && fan_control_enabled() => {
-                app.log_event("🌀 Fan control enabled".into());
+            .output();
+        match out {
+            Ok(o) if o.status.success() && fan_control_enabled() => {
+                startup_events.push("🌀 Fan control enabled".into());
             }
             _ => {
-                app.log_event("⚠️ Cannot enable fan control — run as root".into());
+                startup_events.push("⚠️ Cannot enable fan control — run as root".into());
             }
         }
     } else {
-        app.log_event("🌀 Fan control enabled".into());
+        startup_events.push("🌀 Fan control enabled".into());
+    }
+
+    // Restore the terminal on panic from any exit path; PDEATHSIG on the
+    // stress children handles their cleanup
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        default_hook(info);
+    }));
+
+    let mut terminal = setup_terminal()?;
+    let mut app = App::new();
+
+    if app.thinkpad_hwmon.ends_with("hwmon_missing") {
+        app.log_event("⚠️ thinkpad hwmon not found — fan RPM unavailable".into());
+    }
+    for msg in startup_events {
+        app.log_event(msg);
     }
     app.log_event(format!(
         "🚀 Started!  EPP: {}  Cap: {} MHz",
@@ -1233,6 +1305,25 @@ fn main() -> io::Result<()> {
     // Initial sample
     app.sample();
 
+    let res = run(&mut terminal, &mut app);
+
+    // Cleanup + terminal restore must happen even when the loop errored
+    app.cleanup();
+    let restored = restore_terminal(&mut terminal);
+    res?;
+    restored?;
+
+    println!("Exited. Settings left unchanged.");
+    if let Some(path) = &app.csv_path {
+        if app.recording {
+            println!("Recording saved: {path}");
+        }
+    }
+
+    Ok(())
+}
+
+fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::Result<()> {
     loop {
         // Handle input
         if event::poll(Duration::from_millis(50))? {
@@ -1249,22 +1340,10 @@ fn main() -> io::Result<()> {
         }
 
         // Draw
-        terminal.draw(|frame| draw(frame, &app))?;
+        terminal.draw(|frame| draw(frame, app))?;
 
         if app.should_quit {
-            break;
+            return Ok(());
         }
     }
-
-    app.cleanup();
-    restore_terminal(&mut terminal)?;
-
-    println!("Exited. Settings left unchanged.");
-    if let Some(path) = &app.csv_path {
-        if app.recording {
-            println!("Recording saved: {path}");
-        }
-    }
-
-    Ok(())
 }
