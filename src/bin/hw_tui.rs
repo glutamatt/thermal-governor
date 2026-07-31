@@ -280,7 +280,7 @@ struct App {
     thinkpad_hwmon: String,
     temp_sensor: String,
 
-    events: VecDeque<String>,
+    events: VecDeque<(String, String)>, // (timestamp, message)
     start: Instant,
     last_sample: Instant,
     should_quit: bool,
@@ -383,7 +383,8 @@ impl App {
     }
 
     fn log_event(&mut self, msg: String) {
-        self.events.push_back(msg);
+        let ts = chrono_now().split('T').nth(1).unwrap_or("").to_string();
+        self.events.push_back((ts, msg));
         if self.events.len() > 6 {
             self.events.pop_front();
         }
@@ -788,12 +789,20 @@ fn draw_charts(frame: &mut Frame, area: Rect, app: &App) {
     draw_chart(
         frame,
         top[0],
-        &format!(" {temp_emoji} Temp  {:.0}°C ", app.cur_temp),
-        &app.temp,
-        Color::Yellow,
-        30.0,
-        110.0,
-        5.0,
+        ChartSpec {
+            title: format!(" {temp_emoji} Temp  {:.0}°C ", app.cur_temp),
+            series: &app.temp,
+            color: Color::Yellow,
+            border_color: if app.cur_temp >= 85.0 {
+                Color::Red
+            } else {
+                Color::Yellow
+            },
+            y_min: 30.0,
+            y_max: 110.0,
+            y_pad: 5.0,
+            ref_lines: &[(85.0, Color::LightRed), (95.0, Color::Red)],
+        },
     );
 
     let fan_emoji = if app.cur_fan >= 4000 {
@@ -806,26 +815,35 @@ fn draw_charts(frame: &mut Frame, area: Rect, app: &App) {
     draw_chart(
         frame,
         top[1],
-        &format!(" {fan_emoji} Fan  {} RPM ", app.cur_fan),
-        &app.fan,
-        Color::Cyan,
-        0.0,
-        7000.0,
-        200.0,
+        ChartSpec {
+            title: format!(" {fan_emoji} Fan  {} RPM ", app.cur_fan),
+            series: &app.fan,
+            color: Color::Cyan,
+            border_color: Color::Cyan,
+            y_min: 0.0,
+            y_max: 7000.0,
+            y_pad: 200.0,
+            ref_lines: &[],
+        },
     );
 
     draw_power_chart(frame, top[2], app);
 
-    let thr_emoji = if app.cur_throttle_rate > 0.0 { "⚠️" } else { "✅" };
+    let throttling = app.cur_throttle_rate > 0.0;
+    let thr_emoji = if throttling { "⚠️" } else { "✅" };
     draw_chart(
         frame,
         bot[0],
-        &format!(" {thr_emoji} Throttle  {:.1} ms/s ", app.cur_throttle_rate),
-        &app.throttle_rate,
-        Color::Red,
-        0.0,
-        10.0,
-        1.0,
+        ChartSpec {
+            title: format!(" {thr_emoji} Throttle  {:.1} ms/s ", app.cur_throttle_rate),
+            series: &app.throttle_rate,
+            color: Color::Red,
+            border_color: if throttling { Color::Red } else { Color::DarkGray },
+            y_min: 0.0,
+            y_max: 10.0,
+            y_pad: 1.0,
+            ref_lines: &[],
+        },
     );
 
     let cpu_emoji = if app.cur_cpu >= 80.0 {
@@ -838,70 +856,122 @@ fn draw_charts(frame: &mut Frame, area: Rect, app: &App) {
     draw_chart(
         frame,
         bot[1],
-        &format!(" {cpu_emoji} CPU Usage  {:.0}% ", app.cur_cpu),
-        &app.cpu_usage,
-        Color::Green,
-        0.0,
-        100.0,
-        5.0,
+        ChartSpec {
+            title: format!(" {cpu_emoji} CPU Usage  {:.0}% ", app.cur_cpu),
+            series: &app.cpu_usage,
+            color: Color::Green,
+            border_color: Color::Green,
+            y_min: 0.0,
+            y_max: 100.0,
+            y_pad: 5.0,
+            ref_lines: &[],
+        },
     );
 
     draw_freq_chart(frame, bot[2], app);
 }
 
-fn draw_chart(
-    frame: &mut Frame,
-    area: Rect,
-    title: &str,
-    series: &TimeSeries,
+struct ChartSpec<'a> {
+    title: String,
+    series: &'a TimeSeries,
     color: Color,
+    border_color: Color,
     y_min: f64,
     y_max: f64,
     y_pad: f64,
-) {
-    let data = series.as_vec();
-    let y_bounds = series.y_bounds(y_min, y_max, y_pad);
-    let x_bounds = series.x_bounds();
+    // horizontal reference values, drawn dotted when inside the y range
+    ref_lines: &'a [(f64, Color)],
+}
 
-    // x-axis labels: time ago
+fn fmt_ago(secs: f64) -> String {
+    let m = (secs / 60.0) as u32;
+    let s = (secs % 60.0) as u32;
+    format!("-{m}:{s:02}")
+}
+
+fn x_axis<'a>(x_bounds: [f64; 2]) -> Axis<'a> {
     let range = x_bounds[1] - x_bounds[0];
-    let ago = if range > 0.0 {
-        let m = (range / 60.0) as u32;
-        let s = (range % 60.0) as u32;
-        format!("-{m}:{s:02}")
+    let labels = if range > 0.0 {
+        vec![
+            Line::from(fmt_ago(range)),
+            Line::from(fmt_ago(range / 2.0)),
+            Line::from("now"),
+        ]
     } else {
-        "-0:00".into()
+        vec![Line::from("-0:00"), Line::from("now")]
     };
+    Axis::default()
+        .bounds(x_bounds)
+        .labels(labels)
+        .style(Style::default().fg(Color::DarkGray))
+}
 
-    let dataset = Dataset::default()
-        .data(&data)
-        .graph_type(GraphType::Line)
-        .marker(symbols::Marker::Braille)
-        .style(Style::default().fg(color));
+fn y_axis<'a>(y_bounds: [f64; 2]) -> Axis<'a> {
+    Axis::default()
+        .bounds(y_bounds)
+        .labels(vec![
+            Line::from(format!("{:.0}", y_bounds[0])),
+            Line::from(format!("{:.0}", (y_bounds[0] + y_bounds[1]) / 2.0)),
+            Line::from(format!("{:.0}", y_bounds[1])),
+        ])
+        .style(Style::default().fg(Color::DarkGray))
+}
 
-    let chart = Chart::new(vec![dataset])
+/// Dotted horizontal line: one scatter point every 3s of x range
+fn ref_line_points(x_bounds: [f64; 2], y: f64) -> Vec<(f64, f64)> {
+    let mut pts = Vec::new();
+    let mut x = x_bounds[0];
+    while x <= x_bounds[1] {
+        pts.push((x, y));
+        x += 3.0;
+    }
+    pts
+}
+
+fn draw_chart(frame: &mut Frame, area: Rect, spec: ChartSpec) {
+    let data = spec.series.as_vec();
+    let y_bounds = spec.series.y_bounds(spec.y_min, spec.y_max, spec.y_pad);
+    let x_bounds = spec.series.x_bounds();
+
+    let ref_data: Vec<(Vec<(f64, f64)>, Color)> = spec
+        .ref_lines
+        .iter()
+        .filter(|(v, _)| *v >= y_bounds[0] && *v <= y_bounds[1])
+        .map(|&(v, c)| (ref_line_points(x_bounds, v), c))
+        .collect();
+
+    // Reference lines first so the main curve draws on top
+    let mut datasets: Vec<Dataset> = ref_data
+        .iter()
+        .map(|(pts, c)| {
+            Dataset::default()
+                .data(pts)
+                .graph_type(GraphType::Scatter)
+                .marker(symbols::Marker::Dot)
+                .style(Style::default().fg(*c))
+        })
+        .collect();
+    datasets.push(
+        Dataset::default()
+            .data(&data)
+            .graph_type(GraphType::Line)
+            .marker(symbols::Marker::Braille)
+            .style(Style::default().fg(spec.color)),
+    );
+
+    let chart = Chart::new(datasets)
         .block(
             Block::default()
-                .title(Span::styled(title, Style::default().fg(color).add_modifier(Modifier::BOLD)))
+                .title(Span::styled(
+                    spec.title,
+                    Style::default().fg(spec.color).add_modifier(Modifier::BOLD),
+                ))
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(color)),
+                .border_style(Style::default().fg(spec.border_color)),
         )
-        .x_axis(
-            Axis::default()
-                .bounds(x_bounds)
-                .labels(vec![Line::from(ago), Line::from("now")])
-                .style(Style::default().fg(Color::DarkGray)),
-        )
-        .y_axis(
-            Axis::default()
-                .bounds(y_bounds)
-                .labels(vec![
-                    Line::from(format!("{:.0}", y_bounds[0])),
-                    Line::from(format!("{:.0}", y_bounds[1])),
-                ])
-                .style(Style::default().fg(Color::DarkGray)),
-        );
+        .x_axis(x_axis(x_bounds))
+        .y_axis(y_axis(y_bounds));
 
     frame.render_widget(chart, area);
 }
@@ -924,15 +994,6 @@ fn draw_power_chart(frame: &mut Frame, area: Rect, app: &App) {
     };
     let y_bounds = [y_lo, y_hi.max(1.0)];
     let x_bounds = app.power.x_bounds();
-
-    let range = x_bounds[1] - x_bounds[0];
-    let ago = if range > 0.0 {
-        let m = (range / 60.0) as u32;
-        let s = (range % 60.0) as u32;
-        format!("-{m}:{s:02}")
-    } else {
-        "-0:00".into()
-    };
 
     let mut datasets = Vec::new();
 
@@ -986,21 +1047,8 @@ fn draw_power_chart(frame: &mut Frame, area: Rect, app: &App) {
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(Color::Magenta)),
         )
-        .x_axis(
-            Axis::default()
-                .bounds(x_bounds)
-                .labels(vec![Line::from(ago), Line::from("now")])
-                .style(Style::default().fg(Color::DarkGray)),
-        )
-        .y_axis(
-            Axis::default()
-                .bounds(y_bounds)
-                .labels(vec![
-                    Line::from(format!("{:.0}", y_bounds[0])),
-                    Line::from(format!("{:.0}", y_bounds[1])),
-                ])
-                .style(Style::default().fg(Color::DarkGray)),
-        );
+        .x_axis(x_axis(x_bounds))
+        .y_axis(y_axis(y_bounds));
 
     frame.render_widget(chart, area);
 }
@@ -1022,13 +1070,13 @@ fn draw_freq_chart(frame: &mut Frame, area: Rect, app: &App) {
     let y_bounds = [y_lo, y_hi.max(y_lo + 100.0)];
     let x_bounds = app.freq_avg.x_bounds();
 
-    let range = x_bounds[1] - x_bounds[0];
-    let ago = if range > 0.0 {
-        let m = (range / 60.0) as u32;
-        let s = (range % 60.0) as u32;
-        format!("-{m}:{s:02}")
+    // Current freq cap as a dotted reference line — makes soft-throttling
+    // (freq_max dropping away from the cap) visible at a glance
+    let cap = FREQ_CAPS[app.cap_idx] as f64;
+    let cap_pts = if cap >= y_bounds[0] && cap <= y_bounds[1] {
+        ref_line_points(x_bounds, cap)
     } else {
-        "-0:00".into()
+        Vec::new()
     };
 
     let ds_max = Dataset::default()
@@ -1049,6 +1097,18 @@ fn draw_freq_chart(frame: &mut Frame, area: Rect, app: &App) {
         .marker(symbols::Marker::Braille)
         .style(Style::default().fg(Color::Cyan));
 
+    let mut datasets = Vec::new();
+    if !cap_pts.is_empty() {
+        datasets.push(
+            Dataset::default()
+                .data(&cap_pts)
+                .graph_type(GraphType::Scatter)
+                .marker(symbols::Marker::Dot)
+                .style(Style::default().fg(Color::White)),
+        );
+    }
+    datasets.extend([ds_max, ds_avg, ds_min]);
+
     let title = Line::from(vec![
         Span::styled(" Freq MHz ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         Span::styled("min:", Style::default().fg(Color::DarkGray)),
@@ -1060,7 +1120,7 @@ fn draw_freq_chart(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled(" ", Style::default()),
     ]);
 
-    let chart = Chart::new(vec![ds_max, ds_avg, ds_min])
+    let chart = Chart::new(datasets)
         .block(
             Block::default()
                 .title(title)
@@ -1068,21 +1128,8 @@ fn draw_freq_chart(frame: &mut Frame, area: Rect, app: &App) {
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(Color::Yellow)),
         )
-        .x_axis(
-            Axis::default()
-                .bounds(x_bounds)
-                .labels(vec![Line::from(ago), Line::from("now")])
-                .style(Style::default().fg(Color::DarkGray)),
-        )
-        .y_axis(
-            Axis::default()
-                .bounds(y_bounds)
-                .labels(vec![
-                    Line::from(format!("{:.0}", y_bounds[0])),
-                    Line::from(format!("{:.0}", y_bounds[1])),
-                ])
-                .style(Style::default().fg(Color::DarkGray)),
-        );
+        .x_axis(x_axis(x_bounds))
+        .y_axis(y_axis(y_bounds));
 
     frame.render_widget(chart, area);
 }
@@ -1171,13 +1218,17 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_events(frame: &mut Frame, area: Rect, app: &App) {
+    // Newest entry in white, older ones faded
+    let n = app.events.len();
     let lines: Vec<Line> = app
         .events
         .iter()
-        .map(|e| {
+        .enumerate()
+        .map(|(i, (ts, e))| {
+            let msg_color = if i + 1 == n { Color::White } else { Color::Gray };
             Line::from(vec![
-                Span::styled(" > ", Style::default().fg(Color::DarkGray)),
-                Span::styled(e.as_str(), Style::default().fg(Color::White)),
+                Span::styled(format!(" {ts} "), Style::default().fg(Color::DarkGray)),
+                Span::styled(e.as_str(), Style::default().fg(msg_color)),
             ])
         })
         .collect();
