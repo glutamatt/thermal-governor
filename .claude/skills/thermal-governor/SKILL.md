@@ -13,6 +13,10 @@ is. Read it before changing thresholds, sampling, or anything touching sysfs.
 ## The machine
 
 - **CPU**: Intel Core Ultra 7 155H — 16 cores (6P + 8E + 2LP)
+- **Max frequency differs per core** (`cpuinfo_max_freq`): cpu1/cpu2 reach 4800 MHz, the
+  other P-cores 4500, E-cores 3800, LP-E cores 2500. The kernel clamps each core's
+  `scaling_max_freq` to its own max, so cpu0 (a 4500 core) cannot tell you the cap: read
+  the highest value across cores. "No cap" means 4800.
 - **Package temp**: `/sys/class/thermal/thermal_zone*/` where `type` reads `x86_pkg_temp`.
   Resolve it by `type`, never by a hardcoded index — the numbering is enumeration order
   and moves across boots, exactly like the hwmon node the daemon already discovers by name.
@@ -38,14 +42,21 @@ frequency rather than playing with EPP:
 
 ## Working on this
 
-- The daemon is **a passive observer** right now: 1 Hz sampling, 5-minute rolling buffer,
-  dumps to `/var/lib/thermal-governor/events/` on a threshold event. It restores
-  `settings.json` at boot and reverts to safe defaults on clean shutdown. It does **not**
-  run a control loop — that was the earlier phase, deliberately removed. `hw-tui` is the
-  control surface. Don't reintroduce automatic nudging without saying so explicitly.
+- **Manual tuning is the product.** The auto-tuner is abandoned, and so is the idea of
+  collecting data for one. `hw-tui` is the control surface. The daemon only keeps cap +
+  EPP across reboots and writes an event log (CSV) for post-mortem. It runs no control
+  loop. Don't reintroduce automatic nudging without saying so explicitly.
+- **The fan level is never persisted.** The daemon sets the fan to auto at start and on
+  stop; manual levels last one `hw-tui` session. This is deliberate: a manual level
+  restored at boot, with nobody watching, could leave the fan off under load.
+- **`fan_control=1`**: at boot `thinkpad_acpi` is loaded without it. `hw-tui` reloads the
+  module to enable it, which gives the thinkpad hwmon node a new number — `FanSensor` in
+  `src/hw.rs` re-discovers the node when a read fails.
+- All sysfs access lives in `src/hw.rs`, shared by both binaries. Put new hardware reads
+  there, not in one binary.
 - `thermal-governor.service` is installed and running on the dev machine itself. A
-  `cargo build` is harmless, but `install.sh` restarts the live service — and the daemon
-  owns fan control (`fan_control=1`) and the frequency cap. Restarting it mid-measurement
-  discards the rolling buffer and resets tuning to defaults.
-- The event JSON in `/var/lib/thermal-governor/events/` is accumulated data, not build
-  output. Don't clear it to "clean up" — it is the input for the next auto-tuner.
+  `cargo build` is harmless, but `install.sh` restarts the live service and discards the
+  5-minute rolling buffer. A restart keeps cap and EPP (restored from `settings.json`)
+  but resets the fan to auto.
+- The event CSVs in `/var/lib/thermal-governor/events/` are the user's log, not build
+  output. Don't clear them to "clean up".

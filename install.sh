@@ -56,7 +56,7 @@ mkdir -p "$STATE_DIR"
 info "Installing systemd service"
 cat > "$SERVICE_PATH" <<'EOF'
 [Unit]
-Description=Dynamic Auto-Tuning Thermal Governor
+Description=Thermal settings keeper and event logger
 After=multi-user.target
 
 [Service]
@@ -81,7 +81,7 @@ info "Installation complete!"
 echo ""
 echo "  Service: systemctl status $SERVICE_NAME"
 echo "  Logs:    journalctl -u $SERVICE_NAME -f"
-echo "  State:   $STATE_DIR/tuned-params.json"
+echo "  State:   $STATE_DIR/settings.json"
 echo ""
 
 # Verify

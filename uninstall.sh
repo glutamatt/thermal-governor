@@ -36,20 +36,20 @@ fi
 
 systemctl daemon-reload
 
-# Reset CPU to defaults
-info "Resetting CPU to defaults..."
+# Reset what the daemon and hw-tui change: cap (each core to its own max),
+# EPP (firmware default) and fan (EC-managed)
+info "Resetting CPU and fan to defaults..."
 for d in /sys/devices/system/cpu/cpu*/cpufreq/; do
-    echo 400000  > "${d}scaling_min_freq"  2>/dev/null
-    echo 4500000 > "${d}scaling_max_freq"  2>/dev/null
-    echo balance_power > "${d}energy_performance_preference" 2>/dev/null
+    cat "${d}cpuinfo_max_freq" > "${d}scaling_max_freq" 2>/dev/null || true
+    echo default > "${d}energy_performance_preference" 2>/dev/null || true
 done
-echo 0 > /sys/devices/system/cpu/intel_pstate/hwp_dynamic_boost 2>/dev/null
+echo "level auto" > /proc/acpi/ibm/fan 2>/dev/null || true
 
 echo ""
-info "Uninstalled. CPU reset to defaults."
+info "Uninstalled. CPU and fan reset to defaults."
 echo ""
 
 if [ -d "$STATE_DIR" ]; then
-    echo "  Learned parameters kept at: $STATE_DIR"
+    echo "  Saved settings and event logs kept at: $STATE_DIR"
     echo "  To remove: sudo rm -rf $STATE_DIR"
 fi

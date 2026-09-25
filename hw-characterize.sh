@@ -14,9 +14,12 @@ STEP_SECS=20                    # seconds per load step
 COOL_SECS=15                    # fixed cooldown between caps
 
 # ── Hardware paths ────────────────────────────────────────────────────
-TEMP="/sys/class/thermal/thermal_zone8/temp"
-FAN1="/sys/class/hwmon/hwmon7/fan1_input"
-FAN2="/sys/class/hwmon/hwmon7/fan2_input"
+# Zone and hwmon numbers move across boots: find them by type / name
+find_by() { grep -lx "$2" $1 2>/dev/null | head -1 | xargs -r dirname || true; }
+TEMP="$(find_by '/sys/class/thermal/thermal_zone*/type' x86_pkg_temp)/temp"
+HWMON="$(find_by '/sys/class/hwmon/hwmon*/name' thinkpad)"
+FAN1="$HWMON/fan1_input"
+FAN2="$HWMON/fan2_input"
 THROTTLE="/sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_total_time_ms"
 CPU0_CUR="/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq"
 
@@ -42,6 +45,7 @@ set_all() {
 # ── Preflight ─────────────────────────────────────────────────────────
 [[ $EUID -eq 0 ]] || { echo "Must run as root"; exit 1; }
 command -v stress-ng >/dev/null || { echo "stress-ng not found"; exit 1; }
+[[ -r "$TEMP" && -n "$HWMON" ]] || { echo "Package temp zone or thinkpad hwmon not found"; exit 1; }
 command -v powerprofilesctl >/dev/null || { echo "powerprofilesctl not found"; exit 1; }
 
 TOTAL=$(( ${#CAPS_MHZ[@]} * ${#PROFILES[@]} ))
@@ -68,7 +72,7 @@ echo "cap_mhz,profile,stress_cores,elapsed_s,temp_c,fan1_rpm,fan2_rpm,throttle_t
 STRESS_PID=""
 cleanup() {
     [[ -n "$STRESS_PID" ]] && kill "$STRESS_PID" 2>/dev/null && wait "$STRESS_PID" 2>/dev/null || true
-    set_all scaling_max_freq 4500000
+    for d in $(cpufreq_dirs); do cat "$d/cpuinfo_max_freq" > "$d/scaling_max_freq" 2>/dev/null || true; done
     powerprofilesctl set balanced 2>/dev/null || true
     echo
     echo "Restored defaults. Governor stopped."

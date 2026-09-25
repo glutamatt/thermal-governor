@@ -2,25 +2,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fmt;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
+use thermal_governor::clock::LocalTime;
+use thermal_governor::hw::{self, FanSensor};
 
 // =============================================================================
-// Constants + Hardware paths (ThinkPad X1, Intel Core Ultra 7 155H)
+// Constants
 // =============================================================================
-
-// Zone numbering is not stable across boots/kernels — discover by type at startup
-const TEMP_ZONE_TYPE: &str = "x86_pkg_temp";
-const TEMP_SENSOR_FALLBACK: &str = "/sys/class/thermal/thermal_zone8/temp";
-const THINKPAD_HWMON_NAME: &str = "thinkpad";
-const FAN_CONTROL: &str = "/proc/acpi/ibm/fan";
-const FAN_CONTROL_PARAM: &str = "/sys/module/thinkpad_acpi/parameters/fan_control";
-const THROTTLE_TIME_PATH: &str =
-    "/sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_total_time_ms";
 
 const DATA_DIR: &str = "/var/lib/thermal-governor";
 const EVENTS_DIR: &str = "/var/lib/thermal-governor/events";
@@ -40,31 +32,26 @@ const EVENTS_MAX_FILES: usize = 1000;
 // Persisted settings (what hw-tui last set)
 // =============================================================================
 
+// The fan level is deliberately not part of it: a manual level restored at
+// boot, with nobody watching, could leave the fan off under load. The fan
+// always starts on auto (EC-managed); manual levels last one session.
+// Old files with a `fan_level` field still load: serde ignores it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Settings {
-    fan_level: String,
     freq_cap_mhz: u32,
     epp: String,
 }
 
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            fan_level: "auto".into(),
-            freq_cap_mhz: 4500,
-            epp: "balance_performance".into(),
-        }
-    }
-}
-
 impl Settings {
-    fn load() -> Self {
-        match fs::read_to_string(SETTINGS_FILE) {
-            Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
-                log("settings", &format!("Bad settings file ({e}), using defaults"));
-                Self::default()
-            }),
-            Err(_) => Self::default(),
+    /// None when nothing was saved yet or the file is unreadable
+    fn load() -> Option<Self> {
+        let data = fs::read_to_string(SETTINGS_FILE).ok()?;
+        match serde_json::from_str(&data) {
+            Ok(settings) => Some(settings),
+            Err(e) => {
+                log("settings", &format!("Bad settings file ({e}), ignoring it"));
+                None
+            }
         }
     }
 
@@ -80,23 +67,16 @@ impl Settings {
     }
 
     fn apply(&self, dirs: &[PathBuf]) {
-        // Fan level
-        match self.fan_level.as_str() {
-            "auto" => set_fan_level_raw("level auto"),
-            "disengaged" => set_fan_level_raw("level disengaged"),
-            s => {
-                if let Ok(n) = s.parse::<u8>() {
-                    set_fan_level_raw(&format!("level {n}"));
-                } else {
-                    log("settings", &format!("Unknown fan_level '{}', setting auto", s));
-                    set_fan_level_raw("level auto");
-                }
-            }
-        }
-        // Freq cap
-        set_max_freq(dirs, self.freq_cap_mhz);
-        // EPP
-        set_epp(dirs, &self.epp);
+        hw::set_freq_cap(dirs, self.freq_cap_mhz);
+        hw::set_epp(dirs, &self.epp);
+    }
+
+    /// Actual hardware state; None if any read fails
+    fn from_hw(dirs: &[PathBuf]) -> Option<Self> {
+        Some(Self {
+            freq_cap_mhz: hw::read_freq_cap(dirs)?,
+            epp: hw::read_epp(dirs)?,
+        })
     }
 }
 
@@ -110,12 +90,12 @@ struct Sample {
     temp_c: f64,
     temp_rate: f64,
     cpu_load: f64,
-    fan1_rpm: f64,
-    fan2_rpm: f64,
+    fan1_rpm: u32,
+    fan2_rpm: u32,
     fan_level: String,
-    freq_min: f64,
-    freq_avg: f64,
-    freq_max: f64,
+    freq_min: u32,
+    freq_avg: u32,
+    freq_max: u32,
     freq_cap_mhz: u32,
     epp: String,
     throttle_rate: f64,
@@ -134,7 +114,7 @@ impl Sample {
             .unwrap_or_default()
             .as_secs();
         format!(
-            "{},{:.1},{:.2},{:.3},{:.0},{:.0},{},{:.0},{:.0},{:.0},{},{},{:.1},{:.2}",
+            "{},{:.1},{:.2},{:.3},{},{},{},{},{},{},{},{},{:.1},{:.2}",
             ts,
             self.temp_c,
             self.temp_rate,
@@ -303,7 +283,10 @@ impl TempHistory {
     }
 
     fn push(&mut self, temp: f64) {
-        let now = Instant::now();
+        self.push_at(Instant::now(), temp);
+    }
+
+    fn push_at(&mut self, now: Instant, temp: f64) {
         self.entries.push_back((now, temp));
         // checked_sub: Instant underflows (panics) if uptime < window
         if let Some(cutoff) = now.checked_sub(self.window) {
@@ -348,243 +331,6 @@ impl TempHistory {
             num / den
         }
     }
-}
-
-// =============================================================================
-// CPU usage reader (from /proc/stat)
-// =============================================================================
-
-struct CpuUsage {
-    prev_idle: u64,
-    prev_total: u64,
-}
-
-impl CpuUsage {
-    fn new() -> Self {
-        let (idle, total) = Self::read_stat();
-        Self {
-            prev_idle: idle,
-            prev_total: total,
-        }
-    }
-
-    fn read_stat() -> (u64, u64) {
-        if let Ok(s) = fs::read_to_string("/proc/stat") {
-            if let Some(line) = s.lines().next() {
-                let vals: Vec<u64> = line
-                    .split_whitespace()
-                    .skip(1)
-                    .filter_map(|v| v.parse().ok())
-                    .collect();
-                if vals.len() >= 5 {
-                    let idle = vals[3] + vals[4];
-                    let total: u64 = vals.iter().sum();
-                    return (idle, total);
-                }
-            }
-        }
-        (0, 0)
-    }
-
-    fn sample(&mut self) -> f64 {
-        let (idle, total) = Self::read_stat();
-        let idle_d = idle.saturating_sub(self.prev_idle);
-        let total_d = total.saturating_sub(self.prev_total);
-        self.prev_idle = idle;
-        self.prev_total = total;
-        if total_d == 0 {
-            0.0
-        } else {
-            (1.0 - idle_d as f64 / total_d as f64).clamp(0.0, 1.0)
-        }
-    }
-}
-
-// =============================================================================
-// Hardware I/O
-// =============================================================================
-
-fn read_sysfs_i64(path: impl AsRef<Path>) -> Option<i64> {
-    fs::read_to_string(path).ok()?.trim().parse().ok()
-}
-
-fn read_sysfs_string(path: impl AsRef<Path>) -> Option<String> {
-    Some(fs::read_to_string(path).ok()?.trim().to_string())
-}
-
-fn find_hwmon_by_name(name: &str) -> Option<PathBuf> {
-    for entry in fs::read_dir("/sys/class/hwmon/").ok()? {
-        let entry = entry.ok()?;
-        let n = fs::read_to_string(entry.path().join("name"))
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        if n == name {
-            return Some(entry.path());
-        }
-    }
-    None
-}
-
-fn find_thermal_zone_by_type(zone_type: &str) -> Option<PathBuf> {
-    for entry in fs::read_dir("/sys/class/thermal/").ok()? {
-        let entry = entry.ok()?;
-        if !entry.file_name().to_string_lossy().starts_with("thermal_zone") {
-            continue;
-        }
-        let t = fs::read_to_string(entry.path().join("type")).unwrap_or_default();
-        if t.trim() == zone_type {
-            return Some(entry.path().join("temp"));
-        }
-    }
-    None
-}
-
-fn cpu_temp(sensor: &Path) -> Option<f64> {
-    read_sysfs_i64(sensor).map(|t| t as f64 / 1000.0)
-}
-
-fn fan_rpms(thinkpad_hwmon: &str) -> (f64, f64) {
-    let f1 = read_sysfs_i64(format!("{thinkpad_hwmon}/fan1_input")).unwrap_or(0) as f64;
-    let f2 = read_sysfs_i64(format!("{thinkpad_hwmon}/fan2_input")).unwrap_or(0) as f64;
-    let clamp = |v: f64| if v >= 60000.0 { 0.0 } else { v };
-    (clamp(f1), clamp(f2))
-}
-
-fn read_throttle_time_ms() -> u64 {
-    read_sysfs_i64(THROTTLE_TIME_PATH).unwrap_or(0) as u64
-}
-
-fn read_fan_level() -> Option<String> {
-    let content = fs::read_to_string(FAN_CONTROL).ok()?;
-    for line in content.lines() {
-        if let Some(rest) = line.strip_prefix("level:") {
-            return Some(rest.trim().to_string());
-        }
-    }
-    None
-}
-
-fn set_fan_level_raw(cmd: &str) {
-    let _ = fs::write(FAN_CONTROL, cmd);
-}
-
-fn cpufreq_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Ok(entries) = fs::read_dir("/sys/devices/system/cpu/") {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let s = name.to_string_lossy();
-            if s.starts_with("cpu") && s.len() > 3 && s.as_bytes()[3].is_ascii_digit() {
-                let p = entry.path().join("cpufreq");
-                if p.is_dir() {
-                    dirs.push(p);
-                }
-            }
-        }
-    }
-    dirs.sort();
-    dirs
-}
-
-fn read_cpu_freqs(dirs: &[PathBuf]) -> (f64, f64, f64) {
-    let mut sum = 0.0;
-    let mut min = f64::MAX;
-    let mut max = 0.0f64;
-    let mut count = 0;
-    for d in dirs {
-        if let Some(freq) = read_sysfs_i64(d.join("scaling_cur_freq")) {
-            let mhz = freq as f64 / 1000.0;
-            sum += mhz;
-            min = min.min(mhz);
-            max = max.max(mhz);
-            count += 1;
-        }
-    }
-    if count == 0 {
-        (0.0, 0.0, 0.0)
-    } else {
-        (min, sum / count as f64, max)
-    }
-}
-
-fn read_freq_cap(dirs: &[PathBuf]) -> Option<u32> {
-    // Read from first cpu that has scaling_max_freq
-    for d in dirs {
-        if let Some(freq) = read_sysfs_i64(d.join("scaling_max_freq")) {
-            return Some((freq / 1000) as u32);
-        }
-    }
-    None
-}
-
-fn read_epp(dirs: &[PathBuf]) -> Option<String> {
-    for d in dirs {
-        if let Some(epp) = read_sysfs_string(d.join("energy_performance_preference")) {
-            return Some(epp);
-        }
-    }
-    None
-}
-
-fn set_max_freq(dirs: &[PathBuf], mhz: u32) {
-    let val = (mhz as u64 * 1000).to_string();
-    for d in dirs {
-        let _ = fs::write(d.join("scaling_max_freq"), &val);
-    }
-}
-
-fn set_epp(dirs: &[PathBuf], epp: &str) {
-    for d in dirs {
-        let _ = fs::write(d.join("energy_performance_preference"), epp);
-    }
-}
-
-fn check_fan_control() -> bool {
-    fs::read_to_string(FAN_CONTROL_PARAM)
-        .map(|v| v.trim() == "Y" || v.trim() == "1")
-        .unwrap_or(false)
-}
-
-fn enable_fan_control() -> bool {
-    if check_fan_control() {
-        return true;
-    }
-    log("fan", "Enabling fan_control via modprobe...");
-    let status = Command::new("modprobe")
-        .args(["thinkpad_acpi", "fan_control=1"])
-        .status();
-    match status {
-        Ok(s) if s.success() => {
-            log("fan", "fan_control=1 enabled");
-            true
-        }
-        Ok(s) => {
-            log("fan", &format!("modprobe failed with status {s}"));
-            false
-        }
-        Err(e) => {
-            log("fan", &format!("modprobe error: {e}"));
-            false
-        }
-    }
-}
-
-fn read_rapl_energy_uj() -> u64 {
-    read_sysfs_i64("/sys/class/powercap/intel-rapl:0/energy_uj").unwrap_or(0) as u64
-}
-
-fn read_rapl_max_energy_uj() -> u64 {
-    read_sysfs_i64("/sys/class/powercap/intel-rapl:0/max_energy_range_uj").unwrap_or(0) as u64
-}
-
-/// Actual hardware state as Settings; None if any read fails
-fn current_hw_settings(dirs: &[PathBuf]) -> Option<Settings> {
-    Some(Settings {
-        fan_level: read_fan_level()?,
-        freq_cap_mhz: read_freq_cap(dirs)?,
-        epp: read_epp(dirs)?,
-    })
 }
 
 // =============================================================================
@@ -649,16 +395,7 @@ fn prune_events() {
 // =============================================================================
 
 fn log(tag: &str, msg: &str) {
-    let ts = timestamp();
-    eprintln!("[{ts}] [{tag}] {msg}");
-}
-
-fn timestamp() -> String {
-    Command::new("date")
-        .arg("+%H:%M:%S")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|_| "??:??:??".into())
+    eprintln!("[{}] [{tag}] {msg}", LocalTime::now().time());
 }
 
 // =============================================================================
@@ -666,68 +403,63 @@ fn timestamp() -> String {
 // =============================================================================
 
 fn observer(stop: &AtomicBool) {
-    let dirs = cpufreq_dirs();
+    let dirs = hw::cpufreq_dirs();
     if dirs.is_empty() {
         log("obs", "No cpufreq dirs found!");
         return;
     }
-    let thinkpad_hwmon = find_hwmon_by_name(THINKPAD_HWMON_NAME)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| {
-            log("obs", "WARNING: thinkpad hwmon not found, fan RPMs will be 0");
-            "/sys/class/hwmon/hwmon_missing".to_string()
-        });
-
-    // Startup: ensure fan control, restore settings
-    if !enable_fan_control() {
-        log("obs", "WARNING: fan control not available, fan commands will fail");
+    let mut fans = FanSensor::discover();
+    if !fans.is_found() {
+        log("obs", "WARNING: thinkpad hwmon not found, fan RPMs will be 0");
     }
 
-    let settings = Settings::load();
-    log("obs", &format!("Restoring settings: {:?}", settings));
-    settings.apply(&dirs);
+    // Startup: fan back to the EC, restore the saved cap and EPP
+    hw::set_fan_level("auto");
+    let saved = Settings::load();
+    match &saved {
+        Some(settings) => {
+            log("obs", &format!("Restoring settings: {:?}", settings));
+            settings.apply(&dirs);
+        }
+        None => log("obs", "No saved settings, leaving cap and EPP as they are"),
+    }
 
     // Baseline change-detection on the actual hardware state, not the intended
     // settings: if a restore write failed, trusting the intent would make the
     // next tick see a "change" and overwrite the saved settings with the
     // failed state.
-    let mut last_settings = current_hw_settings(&dirs).unwrap_or(settings);
+    let mut last_settings = Settings::from_hw(&dirs).or(saved);
 
     prune_events();
 
-    let temp_sensor = find_thermal_zone_by_type(TEMP_ZONE_TYPE).unwrap_or_else(|| {
+    let temp_sensor = hw::find_temp_sensor().unwrap_or_else(|| {
         log(
             "obs",
-            &format!("WARNING: no '{TEMP_ZONE_TYPE}' thermal zone, falling back to {TEMP_SENSOR_FALLBACK}"),
+            &format!(
+                "WARNING: no package thermal zone, falling back to {}",
+                hw::TEMP_SENSOR_FALLBACK
+            ),
         );
-        PathBuf::from(TEMP_SENSOR_FALLBACK)
+        PathBuf::from(hw::TEMP_SENSOR_FALLBACK)
     });
-    let mut last_temp = cpu_temp(&temp_sensor).unwrap_or(0.0);
+    let mut last_temp = hw::cpu_temp(&temp_sensor).unwrap_or(0.0);
     let mut temp_read_failed = false;
 
-    let rapl_max_uj = read_rapl_max_energy_uj();
-
     let mut temp_history = TempHistory::new(16);
-    let mut cpu_usage = CpuUsage::new();
+    let mut cpu_usage = hw::CpuUsage::new();
+    let mut throttle = hw::ThrottleMeter::new();
+    let mut rapl = hw::RaplMeter::new();
     let mut buffer: VecDeque<Sample> = VecDeque::with_capacity(BUFFER_CAPACITY);
     let mut detector = EventDetector::new();
-
-    let mut prev_throttle_ms = read_throttle_time_ms();
-    let mut prev_energy_uj = read_rapl_energy_uj();
-    let mut prev_time = Instant::now();
     let mut tick: u64 = 0;
 
     log("obs", "Observer loop started (1Hz sampling, 300-sample buffer)");
 
     while !stop.load(Ordering::Relaxed) {
-        let now = Instant::now();
-        let dt = now.duration_since(prev_time).as_secs_f64().max(0.001);
-        prev_time = now;
-
         // --- Sample all sensors ---
         // On read failure reuse the last temp: a 0.0 sample would poison
         // temp_rate and reset the threshold hysteresis
-        let temp = match cpu_temp(&temp_sensor) {
+        let temp = match hw::cpu_temp(&temp_sensor) {
             Some(t) => {
                 temp_read_failed = false;
                 last_temp = t;
@@ -745,35 +477,15 @@ fn observer(stop: &AtomicBool) {
         let temp_rate = temp_history.rate();
 
         let load = cpu_usage.sample();
-        let (f1, f2) = fan_rpms(&thinkpad_hwmon);
-        let fan_level_r = read_fan_level();
-        let (freq_min, freq_avg, freq_max) = read_cpu_freqs(&dirs);
-        let freq_cap_r = read_freq_cap(&dirs);
-        let epp_r = read_epp(&dirs);
-        let fan_level = fan_level_r.clone().unwrap_or_else(|| "unknown".into());
+        let (f1, f2) = fans.rpms();
+        let fan_level = hw::read_fan_level().unwrap_or_else(|| "unknown".into());
+        let freqs = hw::read_freqs(&dirs);
+        let freq_cap_r = hw::read_freq_cap(&dirs);
+        let epp_r = hw::read_epp(&dirs);
         let freq_cap = freq_cap_r.unwrap_or(0);
         let epp = epp_r.clone().unwrap_or_else(|| "unknown".into());
-
-        let throttle_ms = read_throttle_time_ms();
-        let throttle_rate = (throttle_ms.saturating_sub(prev_throttle_ms)) as f64 / dt;
-        prev_throttle_ms = throttle_ms;
-
-        // The counter wraps at max_energy_range_uj (~262 kJ, every ~1.2h at 60W),
-        // not at u64::MAX. Also discard implausible spikes (suspend/resume,
-        // counter reset).
-        let energy_uj = read_rapl_energy_uj();
-        let delta_uj = if energy_uj >= prev_energy_uj {
-            energy_uj - prev_energy_uj
-        } else if rapl_max_uj > prev_energy_uj {
-            energy_uj + (rapl_max_uj - prev_energy_uj)
-        } else {
-            0
-        };
-        let mut rapl = delta_uj as f64 / (dt * 1_000_000.0);
-        if rapl > 500.0 {
-            rapl = 0.0;
-        }
-        prev_energy_uj = energy_uj;
+        let throttle_rate = throttle.sample().unwrap_or(0.0);
+        let rapl_w = rapl.sample().unwrap_or(0.0);
 
         let sample = Sample {
             timestamp: SystemTime::now(),
@@ -783,13 +495,13 @@ fn observer(stop: &AtomicBool) {
             fan1_rpm: f1,
             fan2_rpm: f2,
             fan_level: fan_level.clone(),
-            freq_min,
-            freq_avg,
-            freq_max,
+            freq_min: freqs.as_ref().map_or(0, |f| f.min),
+            freq_avg: freqs.as_ref().map_or(0, |f| f.avg),
+            freq_max: freqs.as_ref().map_or(0, |f| f.max),
             freq_cap_mhz: freq_cap,
             epp: epp.clone(),
             throttle_rate,
-            rapl_power_w: rapl,
+            rapl_power_w: rapl_w,
         };
 
         // --- Push to rolling buffer ---
@@ -805,24 +517,20 @@ fn observer(stop: &AtomicBool) {
         }
 
         // --- Settings persistence: detect changes from hw-tui ---
-        // Only when all three reads succeeded: a transient sysfs failure must
+        // Only when every read succeeded: a transient sysfs failure must
         // not overwrite the saved settings with "unknown"/fallback values
-        if let (Some(fl), Some(fc), Some(e)) = (fan_level_r, freq_cap_r, epp_r) {
-            let current_settings = Settings {
-                fan_level: fl,
-                freq_cap_mhz: fc,
-                epp: e,
-            };
-            if current_settings != last_settings {
+        if let (Some(freq_cap_mhz), Some(epp)) = (freq_cap_r, epp_r) {
+            let current = Settings { freq_cap_mhz, epp };
+            if last_settings.as_ref() != Some(&current) {
                 log(
                     "settings",
                     &format!(
-                        "Change detected: fan={} cap={} epp={}",
-                        current_settings.fan_level, current_settings.freq_cap_mhz, current_settings.epp
+                        "Change detected: cap={} epp={}",
+                        current.freq_cap_mhz, current.epp
                     ),
                 );
-                current_settings.save();
-                last_settings = current_settings;
+                current.save();
+                last_settings = Some(current);
             }
         }
 
@@ -835,11 +543,11 @@ fn observer(stop: &AtomicBool) {
             log(
                 "status",
                 &format!(
-                    "{:.0}°C Δ{:+.1}°C/s load={:.0}% fan={} rpm={:.0}/{:.0} freq={:.0}/{:.0}/{:.0} cap={} epp={} rapl={:.1}W",
+                    "{:.0}°C Δ{:+.1}°C/s load={:.0}% fan={} rpm={}/{} freq={}/{}/{} cap={} epp={} rapl={:.1}W",
                     temp, temp_rate, load * 100.0,
                     fan_level, f1, f2,
-                    freq_min, freq_avg, freq_max,
-                    freq_cap, epp, rapl,
+                    sample.freq_min, sample.freq_avg, sample.freq_max,
+                    freq_cap, epp, rapl_w,
                 ),
             );
         }
@@ -855,23 +563,22 @@ fn observer(stop: &AtomicBool) {
 fn main() {
     eprintln!("================================================");
     eprintln!("  thermal-governor v{}", env!("CARGO_PKG_VERSION"));
-    eprintln!("  Observer daemon for ThinkPad X1");
+    eprintln!("  Settings keeper + observer for ThinkPad X1");
     eprintln!("================================================");
-    eprintln!("  Mode: passive observer + settings persistence");
-    eprintln!("  Poll: {}ms  Buffer: {} samples (5 min)", POLL_MS, BUFFER_CAPACITY);
     eprintln!("  Settings: {SETTINGS_FILE}");
-    eprintln!("  Events: {EVENTS_DIR}/");
+    eprintln!("  Events:   {EVENTS_DIR}/");
+    eprintln!("  Poll: {}ms  Buffer: {} samples (5 min)", POLL_MS, BUFFER_CAPACITY);
     eprintln!("================================================\n");
 
-    let initial_temp = find_thermal_zone_by_type(TEMP_ZONE_TYPE)
-        .and_then(|p| cpu_temp(&p))
+    let initial_temp = hw::find_temp_sensor()
+        .and_then(|p| hw::cpu_temp(&p))
         .unwrap_or(0.0);
     log(
         "main",
         &format!(
             "Initial: {:.0}°C, fan={}",
             initial_temp,
-            read_fan_level().unwrap_or_else(|| "unknown".into())
+            hw::read_fan_level().unwrap_or_else(|| "unknown".into())
         ),
     );
 
@@ -881,13 +588,101 @@ fn main() {
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&stop))
         .expect("Failed to register SIGINT handler");
 
-    let dirs = cpufreq_dirs();
-
     observer(&stop);
 
-    // Graceful shutdown: conservative defaults
-    log("main", "Shutting down → fan=auto, cap=2000 MHz");
-    set_fan_level_raw("level auto");
-    set_max_freq(&dirs, 2000);
+    // Graceful shutdown: hand the fan back to the EC. Cap and EPP stay as the
+    // user set them, so a restart does not undo the current tuning.
+    log("main", "Shutting down → fan=auto (cap and EPP unchanged)");
+    hw::set_fan_level("auto");
     log("main", "Done. Goodbye.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(temp_c: f64, temp_rate: f64, throttle_rate: f64) -> Sample {
+        Sample {
+            timestamp: SystemTime::UNIX_EPOCH,
+            temp_c,
+            temp_rate,
+            cpu_load: 0.0,
+            fan1_rpm: 0,
+            fan2_rpm: 0,
+            fan_level: "auto".into(),
+            freq_min: 0,
+            freq_avg: 0,
+            freq_max: 0,
+            freq_cap_mhz: 0,
+            epp: "performance".into(),
+            throttle_rate,
+            rapl_power_w: 0.0,
+        }
+    }
+
+    #[test]
+    fn old_settings_file_with_fan_level_still_loads() {
+        let json = r#"{"fan_level": "disengaged", "freq_cap_mhz": 2200, "epp": "performance"}"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            s,
+            Settings {
+                freq_cap_mhz: 2200,
+                epp: "performance".into()
+            }
+        );
+    }
+
+    #[test]
+    fn temp_crossing_fires_once_until_hysteresis_resets() {
+        let mut d = EventDetector::new();
+        assert_eq!(d.detect(&sample(86.0, 0.0, 0.0)), vec![EventType::TempCross85]);
+        // still above, and inside the hysteresis band: no new event
+        assert!(d.detect(&sample(87.0, 0.0, 0.0)).is_empty());
+        assert!(d.detect(&sample(84.0, 0.0, 0.0)).is_empty());
+        assert!(d.detect(&sample(86.0, 0.0, 0.0)).is_empty());
+        // dropped below 83: re-armed, but the 60 s cooldown still blocks it
+        assert!(d.detect(&sample(80.0, 0.0, 0.0)).is_empty());
+        assert!(d.detect(&sample(86.0, 0.0, 0.0)).is_empty());
+    }
+
+    #[test]
+    fn rapid_rise_needs_three_consecutive_samples() {
+        let mut d = EventDetector::new();
+        assert!(d.detect(&sample(60.0, 3.0, 0.0)).is_empty());
+        assert!(d.detect(&sample(62.0, 3.0, 0.0)).is_empty());
+        assert!(d.detect(&sample(63.0, 1.0, 0.0)).is_empty()); // streak broken
+        assert!(d.detect(&sample(65.0, 3.0, 0.0)).is_empty());
+        assert!(d.detect(&sample(67.0, 3.0, 0.0)).is_empty());
+        assert_eq!(d.detect(&sample(70.0, 3.0, 0.0)), vec![EventType::RapidTempRise]);
+    }
+
+    #[test]
+    fn throttle_fires_with_cooldown() {
+        let mut d = EventDetector::new();
+        assert_eq!(d.detect(&sample(60.0, 0.0, 5.0)), vec![EventType::Throttle]);
+        assert!(d.detect(&sample(60.0, 0.0, 5.0)).is_empty());
+    }
+
+    #[test]
+    fn temp_rate_is_slope_in_degrees_per_second() {
+        let mut h = TempHistory::new(16);
+        let t0 = Instant::now();
+        for i in 0..5 {
+            h.push_at(t0 + Duration::from_secs(i), 50.0 + 2.0 * i as f64);
+        }
+        assert!((h.rate() - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn temp_history_drops_entries_outside_window() {
+        let mut h = TempHistory::new(16);
+        let t0 = Instant::now();
+        h.push_at(t0, 90.0);
+        for i in 20..25 {
+            h.push_at(t0 + Duration::from_secs(i), 50.0);
+        }
+        assert_eq!(h.entries.len(), 5);
+        assert_eq!(h.rate(), 0.0);
+    }
 }

@@ -2,7 +2,7 @@
 name = "thermal-governor"
 version = "0.1.0"
 edition = "2021"
-description = "Dynamic auto-tuning thermal governor for Linux laptops with aggressive fan curves"
+description = "Manual thermal tuning TUI and settings-keeper daemon for the ThinkPad X1 Carbon Gen 12"
 license = "MIT"
 repository = "https://github.com/glutamatt/thermal-governor"
 keywords = ["thermal", "cpu", "governor", "thinkpad", "linux"]

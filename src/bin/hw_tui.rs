@@ -15,31 +15,28 @@ use ratatui::{
     },
 };
 use std::collections::VecDeque;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, BufWriter, Stdout, Write as IoWrite};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
+use thermal_governor::clock::LocalTime;
+use thermal_governor::hw::{self, FanSensor};
 
 // =============================================================================
 // Constants
 // =============================================================================
 
-// Zone numbering is not stable across boots/kernels — discover by type at startup
-const TEMP_ZONE_TYPE: &str = "x86_pkg_temp";
-const TEMP_SENSOR_FALLBACK: &str = "/sys/class/thermal/thermal_zone8/temp";
-const THROTTLE_PATH: &str =
-    "/sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_total_time_ms";
-const EPP_PATH: &str = "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference";
-const RAPL_PKG_PATH: &str = "/sys/class/powercap/intel-rapl:0/energy_uj";
-const FAN_CTRL: &str = "/proc/acpi/ibm/fan";
 const FAN_LEVELS: &[&str] = &["0", "1", "2", "3", "4", "5", "6", "7", "disengaged"];
 
 const HISTORY_CAP: usize = 300; // 5 minutes at 1Hz
+const SAMPLE_PERIOD: Duration = Duration::from_secs(1);
 
 const STRESS_LEVELS: &[u32] = &[0, 1, 2, 4, 8, 16];
-const FREQ_CAPS: &[u32] = &[2000, 2200, 2400, 2600, 2800, 3000, 3200, 3400, 3600, 3800, 4000, 4200, 4400, 4500];
+// Cap steps go from FREQ_CAP_MIN up to the highest core frequency (= no cap)
+const FREQ_CAP_MIN: u32 = 2000;
+const FREQ_CAP_STEP: usize = 200;
 const EPP_VALUES: &[&str] = &["power", "balance_power", "balance_performance", "performance", "default"];
 
 // =============================================================================
@@ -98,149 +95,39 @@ impl TimeSeries {
 }
 
 // =============================================================================
-// Hardware I/O
+// Hardware state helpers
 // =============================================================================
 
-fn find_hwmon_by_name(name: &str) -> Option<PathBuf> {
-    for entry in fs::read_dir("/sys/class/hwmon/").ok()? {
-        let entry = entry.ok()?;
-        let n = fs::read_to_string(entry.path().join("name"))
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        if n == name {
-            return Some(entry.path());
-        }
-    }
-    None
-}
-
-fn read_sysfs_i64(path: &str) -> Option<i64> {
-    fs::read_to_string(path).ok()?.trim().parse().ok()
-}
-
-fn read_sysfs_str(path: &str) -> String {
-    fs::read_to_string(path)
-        .unwrap_or_default()
-        .trim()
-        .to_string()
-}
-
-fn find_thermal_zone_by_type(zone_type: &str) -> Option<String> {
-    for entry in fs::read_dir("/sys/class/thermal/").ok()? {
-        let entry = entry.ok()?;
-        if !entry.file_name().to_string_lossy().starts_with("thermal_zone") {
-            continue;
-        }
-        let t = fs::read_to_string(entry.path().join("type")).unwrap_or_default();
-        if t.trim() == zone_type {
-            return Some(entry.path().join("temp").to_string_lossy().to_string());
-        }
-    }
-    None
-}
-
-fn read_temp(sensor: &str) -> f64 {
-    read_sysfs_i64(sensor).unwrap_or(0) as f64 / 1000.0
-}
-
-fn read_fan_rpms(thinkpad_hwmon: &str) -> (u32, u32) {
-    let f1 = read_sysfs_i64(&format!("{thinkpad_hwmon}/fan1_input")).unwrap_or(0) as u32;
-    let f2 = read_sysfs_i64(&format!("{thinkpad_hwmon}/fan2_input")).unwrap_or(0) as u32;
-    let f1 = if f1 >= 60_000 { 0 } else { f1 };
-    let f2 = if f2 >= 60_000 { 0 } else { f2 };
-    (f1, f2)
-}
-
-fn read_throttle_ms() -> u64 {
-    read_sysfs_i64(THROTTLE_PATH).unwrap_or(0) as u64
-}
-
-fn read_epp() -> String {
-    read_sysfs_str(EPP_PATH)
-}
-
-fn read_energy_uj() -> u64 {
-    read_sysfs_i64(RAPL_PKG_PATH).unwrap_or(0) as u64
-}
-
-fn read_battery_power_w() -> Option<f64> {
-    let status = read_sysfs_str("/sys/class/power_supply/BAT0/status");
-    if status != "Discharging" {
-        return None;
-    }
-    let uw = read_sysfs_i64("/sys/class/power_supply/BAT0/power_now")?;
-    Some(uw as f64 / 1_000_000.0)
-}
-
-fn read_cpu_usage() -> (u64, u64) {
-    let content = fs::read_to_string("/proc/stat").unwrap_or_default();
-    let first = content.lines().next().unwrap_or("");
-    let fields: Vec<u64> = first
-        .split_whitespace()
-        .skip(1)
-        .filter_map(|s| s.parse().ok())
-        .collect();
-    let total: u64 = fields.iter().sum();
-    let idle = fields.get(3).copied().unwrap_or(0) + fields.get(4).copied().unwrap_or(0);
-    (idle, total)
-}
-
-fn set_epp(dirs: &[PathBuf], epp: &str) {
-    for d in dirs {
-        let _ = fs::write(d.join("energy_performance_preference"), epp);
-    }
-}
-
-fn set_fan_level(level: &str) {
-    let _ = fs::write(FAN_CTRL, format!("level {level}"));
-}
-
-fn set_fan_auto() {
-    let _ = fs::write(FAN_CTRL, "level auto");
-}
-
-/// Current fan state from /proc/acpi/ibm/fan → (auto, level index)
+/// Current fan state → (auto, level index)
 fn read_fan_state() -> (bool, usize) {
-    if let Ok(content) = fs::read_to_string(FAN_CTRL) {
-        for line in content.lines() {
-            if let Some(rest) = line.strip_prefix("level:") {
-                let lvl = rest.trim();
-                if let Some(pos) = FAN_LEVELS.iter().position(|&l| l == lvl) {
-                    return (false, pos);
-                }
-                break; // "auto" or unknown
-            }
-        }
-    }
-    (true, 4)
-}
-
-fn cpufreq_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Ok(entries) = fs::read_dir("/sys/devices/system/cpu/") {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let s = name.to_string_lossy().to_string();
-            if s.starts_with("cpu") && s.len() > 3 && s.as_bytes()[3].is_ascii_digit() {
-                let p = entry.path().join("cpufreq");
-                if p.is_dir() {
-                    dirs.push(p);
-                }
-            }
-        }
-    }
-    dirs.sort();
-    dirs
-}
-
-fn set_freq_cap(dirs: &[PathBuf], mhz: u32) {
-    let khz = (mhz as u64 * 1000).to_string();
-    for d in dirs {
-        let _ = fs::write(d.join("scaling_max_freq"), &khz);
+    match hw::read_fan_level().and_then(|lvl| FAN_LEVELS.iter().position(|&l| l == lvl)) {
+        Some(pos) => (false, pos),
+        None => (true, 4), // "auto" or unreadable
     }
 }
 
+/// FREQ_CAP_MIN, +200, +400, … then `top`, the highest core frequency
+fn cap_steps(top: u32) -> Vec<u32> {
+    let mut steps: Vec<u32> = (FREQ_CAP_MIN..top).step_by(FREQ_CAP_STEP).collect();
+    steps.push(top);
+    steps
+}
+
+/// Next step above the current cap. Works from any cap, even one set outside
+/// hw-tui that is not on a step.
+fn next_cap(steps: &[u32], cur: Option<u32>) -> Option<u32> {
+    match cur {
+        Some(cur) => steps.iter().copied().find(|&s| s > cur),
+        None => steps.last().copied(),
+    }
+}
+
+fn prev_cap(steps: &[u32], cur: Option<u32>) -> Option<u32> {
+    match cur {
+        Some(cur) => steps.iter().copied().rev().find(|&s| s < cur),
+        None => steps.first().copied(),
+    }
+}
 
 // =============================================================================
 // App
@@ -259,7 +146,7 @@ struct App {
     freq_max: TimeSeries,
 
     stress_idx: usize,
-    cap_idx: usize,
+    cap_steps: Vec<u32>,
     epp_idx: usize,
     fan_level_idx: usize,
     fan_auto: bool,
@@ -270,15 +157,12 @@ struct App {
     csv_writer: Option<BufWriter<File>>,
     csv_path: Option<String>,
 
-    prev_throttle_ms: u64,
-    prev_throttle_time: Instant,
-    prev_energy_uj: u64,
-    prev_energy_time: Instant,
-    prev_cpu_idle: u64,
-    prev_cpu_total: u64,
+    cpu_meter: hw::CpuUsage,
+    throttle_meter: hw::ThrottleMeter,
+    rapl_meter: hw::RaplMeter,
     cpufreq_dirs: Vec<PathBuf>,
-    thinkpad_hwmon: String,
-    temp_sensor: String,
+    fans: FanSensor,
+    temp_sensor: PathBuf,
 
     events: VecDeque<(String, String)>, // (timestamp, message)
     start: Instant,
@@ -289,6 +173,10 @@ struct App {
     cur_fan: u32,
     cur_fan1: u32,
     cur_fan2: u32,
+    // Read back from sysfs on every sample, never assumed from the last
+    // write: the daemon restores settings at boot and other tools can
+    // change them while hw-tui runs
+    cur_cap: Option<u32>,
     cur_epp: String,
     cur_throttle_rate: f64,
     cur_cpu: f64,
@@ -301,25 +189,14 @@ struct App {
 
 impl App {
     fn new() -> Self {
-        let dirs = cpufreq_dirs();
-        let thinkpad_hwmon = find_hwmon_by_name("thinkpad")
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| "/sys/class/hwmon/hwmon_missing".to_string());
-        let temp_sensor = find_thermal_zone_by_type(TEMP_ZONE_TYPE)
-            .unwrap_or_else(|| TEMP_SENSOR_FALLBACK.to_string());
-        let (idle, total) = read_cpu_usage();
+        let dirs = hw::cpufreq_dirs();
+        let temp_sensor =
+            hw::find_temp_sensor().unwrap_or_else(|| PathBuf::from(hw::TEMP_SENSOR_FALLBACK));
         let now = Instant::now();
-        let thr = read_throttle_ms();
-        let energy = read_energy_uj();
-        let epp = read_epp();
-
-        // Sync UI state with the actual hardware state — the tool doesn't
-        // reset on exit and the observer daemon restores settings at boot,
-        // so assuming defaults would mislabel the status bar and CSVs
-        let cap_idx = read_sysfs_i64("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq")
-            .map(|khz| (khz / 1000) as u32)
-            .and_then(|mhz| FREQ_CAPS.iter().position(|&c| c >= mhz))
-            .unwrap_or(FREQ_CAPS.len() - 1);
+        let epp = hw::read_epp(&dirs).unwrap_or_default();
+        let cur_cap = hw::read_freq_cap(&dirs);
+        // Fallback on the current cap: never offer a top below what is set now
+        let cap_top = hw::max_hw_freq(&dirs).or(cur_cap).unwrap_or(FREQ_CAP_MIN);
         let (fan_auto, fan_level_idx) = read_fan_state();
 
         // detect current EPP index
@@ -341,7 +218,7 @@ impl App {
             freq_max: TimeSeries::new(),
 
             stress_idx: 0,
-            cap_idx,
+            cap_steps: cap_steps(cap_top),
             epp_idx,
             fan_level_idx,
             fan_auto,
@@ -352,14 +229,11 @@ impl App {
             csv_writer: None,
             csv_path: None,
 
-            prev_throttle_ms: thr,
-            prev_throttle_time: now,
-            prev_energy_uj: energy,
-            prev_energy_time: now,
-            prev_cpu_idle: idle,
-            prev_cpu_total: total,
+            cpu_meter: hw::CpuUsage::new(),
+            throttle_meter: hw::ThrottleMeter::new(),
+            rapl_meter: hw::RaplMeter::new(),
             cpufreq_dirs: dirs,
-            thinkpad_hwmon,
+            fans: FanSensor::discover(),
             temp_sensor,
 
             events: VecDeque::with_capacity(10),
@@ -371,6 +245,7 @@ impl App {
             cur_fan: 0,
             cur_fan1: 0,
             cur_fan2: 0,
+            cur_cap,
             cur_epp: epp,
             cur_throttle_rate: 0.0,
             cur_cpu: 0.0,
@@ -383,23 +258,35 @@ impl App {
     }
 
     fn log_event(&mut self, msg: String) {
-        let ts = chrono_now().split('T').nth(1).unwrap_or("").to_string();
-        self.events.push_back((ts, msg));
+        self.events.push_back((LocalTime::now().time(), msg));
         if self.events.len() > 6 {
             self.events.pop_front();
+        }
+    }
+
+    /// Cap label for the UI: the top step is the highest core frequency, i.e. no cap
+    fn cap_label(&self) -> String {
+        match self.cur_cap {
+            Some(mhz) if self.cap_steps.last().is_some_and(|&top| mhz >= top) => {
+                format!("{mhz} MHz (max)")
+            }
+            Some(mhz) => format!("{mhz} MHz"),
+            None => "? MHz".into(),
         }
     }
 
     fn sample(&mut self) {
         let elapsed = self.start.elapsed().as_secs_f64();
 
-        // Temperature
-        let temp = read_temp(&self.temp_sensor);
-        self.temp.push(elapsed, temp);
-        self.cur_temp = temp;
+        // Temperature: on a failed read keep the last value and skip the
+        // point, so the chart does not plunge to 0
+        if let Some(temp) = hw::cpu_temp(&self.temp_sensor) {
+            self.temp.push(elapsed, temp);
+            self.cur_temp = temp;
+        }
 
         // Fan
-        let (f1, f2) = read_fan_rpms(&self.thinkpad_hwmon);
+        let (f1, f2) = self.fans.rpms();
         let fan = f1.max(f2);
         self.fan.push(elapsed, fan as f64);
         self.cur_fan = fan;
@@ -407,90 +294,43 @@ impl App {
         self.cur_fan2 = f2;
 
         // Throttle rate
-        let thr_now = read_throttle_ms();
-        let dt = self.prev_throttle_time.elapsed().as_secs_f64();
-        let rate = if dt > 0.0 {
-            (thr_now.saturating_sub(self.prev_throttle_ms)) as f64 / dt
-        } else {
-            0.0
-        };
+        let rate = self.throttle_meter.sample().unwrap_or(0.0);
         self.throttle_rate.push(elapsed, rate);
         self.cur_throttle_rate = rate;
-        self.prev_throttle_ms = thr_now;
-        self.prev_throttle_time = Instant::now();
 
         // CPU usage
-        let (idle, total) = read_cpu_usage();
-        let d_idle = idle.saturating_sub(self.prev_cpu_idle) as f64;
-        let d_total = total.saturating_sub(self.prev_cpu_total) as f64;
-        let usage = if d_total > 0.0 {
-            100.0 * (1.0 - d_idle / d_total)
-        } else {
-            0.0
-        };
+        let usage = 100.0 * self.cpu_meter.sample();
         self.cpu_usage.push(elapsed, usage);
         self.cur_cpu = usage;
-        self.prev_cpu_idle = idle;
-        self.prev_cpu_total = total;
 
         // Power (RAPL)
-        let energy = read_energy_uj();
-        let energy_dt = self.prev_energy_time.elapsed().as_secs_f64();
-        if energy_dt > 0.0 && energy > self.prev_energy_uj {
-            let watts = (energy - self.prev_energy_uj) as f64 / (energy_dt * 1_000_000.0);
+        if let Some(watts) = self.rapl_meter.sample() {
             self.power.push(elapsed, watts);
             self.cur_power_w = watts;
         }
-        self.prev_energy_uj = energy;
-        self.prev_energy_time = Instant::now();
 
         // System power (battery)
-        self.cur_sys_power_w = read_battery_power_w();
+        self.cur_sys_power_w = hw::battery_power_w();
         if let Some(sys_w) = self.cur_sys_power_w {
             self.sys_power.push(elapsed, sys_w);
             let rest = (sys_w - self.cur_power_w).max(0.0);
             self.rest_power.push(elapsed, rest);
         }
 
-        // Freq (all cores: min/avg/max) + EPP
-        let mut fmin = u32::MAX;
-        let mut fmax = 0u32;
-        let mut fsum = 0u64;
-        let mut fcount = 0u32;
-        for d in &self.cpufreq_dirs {
-            let p = d.join("scaling_cur_freq");
-            if let Some(khz) = read_sysfs_i64(p.to_str().unwrap_or("")) {
-                let mhz = (khz / 1000) as u32;
-                if mhz < fmin {
-                    fmin = mhz;
-                }
-                if mhz > fmax {
-                    fmax = mhz;
-                }
-                fsum += mhz as u64;
-                fcount += 1;
-            }
-        }
-        let favg = if fcount > 0 {
-            (fsum / fcount as u64) as u32
-        } else {
-            0
-        };
-        if fmin == u32::MAX {
-            fmin = 0;
-        }
-        self.freq_min.push(elapsed, fmin as f64);
-        self.freq_avg.push(elapsed, favg as f64);
-        self.freq_max.push(elapsed, fmax as f64);
-        self.cur_freq_min = fmin;
-        self.cur_freq_avg = favg;
-        self.cur_freq_max = fmax;
-        self.cur_epp = read_epp();
+        // Freq (all cores: min/avg/max) + cap + EPP
+        let freqs = hw::read_freqs(&self.cpufreq_dirs);
+        self.cur_freq_min = freqs.as_ref().map_or(0, |f| f.min);
+        self.cur_freq_avg = freqs.as_ref().map_or(0, |f| f.avg);
+        self.cur_freq_max = freqs.as_ref().map_or(0, |f| f.max);
+        self.freq_min.push(elapsed, self.cur_freq_min as f64);
+        self.freq_avg.push(elapsed, self.cur_freq_avg as f64);
+        self.freq_max.push(elapsed, self.cur_freq_max as f64);
+        self.cur_cap = hw::read_freq_cap(&self.cpufreq_dirs);
+        self.cur_epp = hw::read_epp(&self.cpufreq_dirs).unwrap_or_default();
 
         // CSV
         if self.recording {
             if let Some(ref mut w) = self.csv_writer {
-                let ts = chrono_now();
                 let rec_elapsed = self
                     .rec_start
                     .map(|s| s.elapsed().as_secs_f64())
@@ -498,19 +338,19 @@ impl App {
                 let _ = writeln!(
                     w,
                     "{},{:.1},{:.0},{},{},{},{},{:.1},{:.1},{},{},{},{},{:.1},{},{}",
-                    ts,
+                    LocalTime::now().iso(),
                     rec_elapsed,
-                    temp,
+                    self.cur_temp,
                     f1,
                     f2,
                     fan,
-                    thr_now,
+                    self.throttle_meter.total_ms().unwrap_or(0),
                     rate,
                     usage,
                     self.cur_freq_min,
                     self.cur_freq_avg,
                     self.cur_freq_max,
-                    FREQ_CAPS[self.cap_idx],
+                    self.cur_cap.unwrap_or(0),
                     self.cur_power_w,
                     self.cur_epp,
                     STRESS_LEVELS[self.stress_idx],
@@ -563,17 +403,22 @@ impl App {
         }
     }
 
-    fn set_cap(&mut self, idx: usize) {
-        self.cap_idx = idx;
-        let mhz = FREQ_CAPS[idx];
-        set_freq_cap(&self.cpufreq_dirs, mhz);
-        self.log_event(format!("📏 Freq cap → {mhz} MHz"));
+    fn step_cap(&mut self, up: bool) {
+        let target = if up {
+            next_cap(&self.cap_steps, self.cur_cap)
+        } else {
+            prev_cap(&self.cap_steps, self.cur_cap)
+        };
+        let Some(mhz) = target else { return };
+        hw::set_freq_cap(&self.cpufreq_dirs, mhz);
+        self.cur_cap = hw::read_freq_cap(&self.cpufreq_dirs);
+        self.log_event(format!("📏 Freq cap → {}", self.cap_label()));
     }
 
     fn cycle_epp(&mut self) {
         self.epp_idx = (self.epp_idx + 1) % EPP_VALUES.len();
         let epp = EPP_VALUES[self.epp_idx];
-        set_epp(&self.cpufreq_dirs, epp);
+        hw::set_epp(&self.cpufreq_dirs, epp);
         self.cur_epp = epp.to_string();
         let emoji = match epp {
             "power" => "🔋",
@@ -592,7 +437,7 @@ impl App {
             self.recording = false;
             self.log_event("⏹️  Recording stopped".into());
         } else {
-            let ts = chrono_now().replace(':', "-");
+            let ts = LocalTime::now().iso().replace(':', "-");
             let path = format!("hw-tui-{ts}.csv");
             match File::create(&path) {
                 Ok(f) => {
@@ -614,18 +459,8 @@ impl App {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Up => self.fan_up(),
             KeyCode::Down => self.fan_down(),
-            KeyCode::Right => {
-                let next = (self.cap_idx + 1).min(FREQ_CAPS.len() - 1);
-                if next != self.cap_idx {
-                    self.set_cap(next);
-                }
-            }
-            KeyCode::Left => {
-                if self.cap_idx > 0 {
-                    let next = self.cap_idx - 1;
-                    self.set_cap(next);
-                }
-            }
+            KeyCode::Right => self.step_cap(true),
+            KeyCode::Left => self.step_cap(false),
             KeyCode::Char('p') => self.cycle_epp(),
             KeyCode::Char('r') => self.toggle_recording(),
             KeyCode::Char('a') => self.toggle_fan_auto(),
@@ -648,11 +483,11 @@ impl App {
     fn toggle_fan_auto(&mut self) {
         if self.fan_auto {
             let level = FAN_LEVELS[self.fan_level_idx];
-            set_fan_level(level);
+            hw::set_fan_level(level);
             self.fan_auto = false;
             self.log_event(format!("🌀 Fan → manual level {level}"));
         } else {
-            set_fan_auto();
+            hw::set_fan_level("auto");
             self.fan_auto = true;
             self.log_event("🌀 Fan → auto (EC)".into());
         }
@@ -663,7 +498,7 @@ impl App {
         if next != self.fan_level_idx {
             self.fan_level_idx = next;
             let level = FAN_LEVELS[next];
-            set_fan_level(level);
+            hw::set_fan_level(level);
             self.fan_auto = false;
             self.log_event(format!("🌀 Fan → level {level}"));
         }
@@ -673,7 +508,7 @@ impl App {
         if self.fan_level_idx > 0 {
             self.fan_level_idx -= 1;
             let level = FAN_LEVELS[self.fan_level_idx];
-            set_fan_level(level);
+            hw::set_fan_level(level);
             self.fan_auto = false;
             self.log_event(format!("🌀 Fan → level {level}"));
         }
@@ -682,19 +517,6 @@ impl App {
     fn cleanup(&mut self) {
         self.stop_stress();
     }
-}
-
-fn chrono_now() -> String {
-    // Simple timestamp without chrono dependency
-    let output = Command::new("date")
-        .arg("+%Y-%m-%dT%H:%M:%S")
-        .output()
-        .ok();
-    output
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default()
-        .trim()
-        .to_string()
 }
 
 // =============================================================================
@@ -1072,11 +894,9 @@ fn draw_freq_chart(frame: &mut Frame, area: Rect, app: &App) {
 
     // Current freq cap as a dotted reference line — makes soft-throttling
     // (freq_max dropping away from the cap) visible at a glance
-    let cap = FREQ_CAPS[app.cap_idx] as f64;
-    let cap_pts = if cap >= y_bounds[0] && cap <= y_bounds[1] {
-        ref_line_points(x_bounds, cap)
-    } else {
-        Vec::new()
+    let cap_pts = match app.cur_cap.map(f64::from) {
+        Some(cap) if cap >= y_bounds[0] && cap <= y_bounds[1] => ref_line_points(x_bounds, cap),
+        _ => Vec::new(),
     };
 
     let ds_max = Dataset::default()
@@ -1162,7 +982,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled(&stress_label, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::raw("   📏 Cap: "),
         Span::styled(
-            format!("{} MHz", FREQ_CAPS[app.cap_idx]),
+            app.cap_label(),
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ),
         Span::raw("   📊 Freq: "),
@@ -1289,13 +1109,6 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Re
 // Main
 // =============================================================================
 
-fn fan_control_enabled() -> bool {
-    fs::read_to_string("/sys/module/thinkpad_acpi/parameters/fan_control")
-        .unwrap_or_default()
-        .trim()
-        == "Y"
-}
-
 fn main() -> io::Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         let exe = std::env::current_exe().expect("cannot resolve own path");
@@ -1308,17 +1121,17 @@ fn main() -> io::Result<()> {
     }
 
     // Enable fan control BEFORE App::new(): reloading thinkpad_acpi
-    // re-registers the hwmon device under a new number, which would
-    // invalidate an already-discovered path
+    // re-registers the hwmon device under a new number, so discovering it
+    // afterwards avoids a first round of failed fan reads
     let mut startup_events: Vec<String> = Vec::new();
-    if !fan_control_enabled() {
+    if !hw::fan_control_enabled() {
         startup_events.push("🌀 Enabling fan control (reloading thinkpad_acpi)...".into());
         let out = Command::new("sh")
             .arg("-c")
             .arg("modprobe -r thinkpad_acpi && modprobe thinkpad_acpi fan_control=1")
             .output();
         match out {
-            Ok(o) if o.status.success() && fan_control_enabled() => {
+            Ok(o) if o.status.success() && hw::fan_control_enabled() => {
                 startup_events.push("🌀 Fan control enabled".into());
             }
             _ => {
@@ -1341,16 +1154,16 @@ fn main() -> io::Result<()> {
     let mut terminal = setup_terminal()?;
     let mut app = App::new();
 
-    if app.thinkpad_hwmon.ends_with("hwmon_missing") {
+    if !app.fans.is_found() {
         app.log_event("⚠️ thinkpad hwmon not found — fan RPM unavailable".into());
     }
     for msg in startup_events {
         app.log_event(msg);
     }
     app.log_event(format!(
-        "🚀 Started!  EPP: {}  Cap: {} MHz",
+        "🚀 Started!  EPP: {}  Cap: {}",
         app.cur_epp,
-        FREQ_CAPS[app.cap_idx]
+        app.cap_label()
     ));
 
     // Initial sample
@@ -1375,26 +1188,63 @@ fn main() -> io::Result<()> {
 }
 
 fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::Result<()> {
+    // Redraw only when something changed: a constant redraw would load
+    // the CPU this tool is measuring
+    let mut dirty = true;
     loop {
-        // Handle input
-        if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+        if dirty {
+            terminal.draw(|frame| draw(frame, app))?;
+            dirty = false;
+        }
+
+        // Wait for input until the next sample is due
+        let timeout = SAMPLE_PERIOD.saturating_sub(app.last_sample.elapsed());
+        if event::poll(timeout)? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
                     app.handle_key(key.code);
+                    dirty = true;
                 }
+                Event::Resize(..) => dirty = true,
+                _ => {}
             }
         }
-
-        // Sample at 1Hz
-        if app.last_sample.elapsed() >= Duration::from_secs(1) {
-            app.sample();
-        }
-
-        // Draw
-        terminal.draw(|frame| draw(frame, app))?;
-
         if app.should_quit {
             return Ok(());
         }
+
+        // Sample at 1Hz
+        if app.last_sample.elapsed() >= SAMPLE_PERIOD {
+            app.sample();
+            dirty = true;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cap_steps_end_at_the_highest_core_frequency() {
+        let steps = cap_steps(4800);
+        assert_eq!(steps.first(), Some(&2000));
+        assert_eq!(&steps[steps.len() - 3..], &[4400, 4600, 4800]);
+        // top not on the 200 MHz grid
+        assert_eq!(&cap_steps(4500)[12..], &[4400, 4500]);
+    }
+
+    #[test]
+    fn cap_moves_from_any_current_value() {
+        let steps = cap_steps(4800);
+        assert_eq!(next_cap(&steps, Some(2000)), Some(2200));
+        assert_eq!(next_cap(&steps, Some(2100)), Some(2200)); // set outside hw-tui
+        assert_eq!(prev_cap(&steps, Some(2100)), Some(2000));
+        assert_eq!(next_cap(&steps, Some(4600)), Some(4800));
+        assert_eq!(next_cap(&steps, Some(4800)), None);
+        assert_eq!(prev_cap(&steps, Some(2000)), None);
+        // below the floor (set elsewhere): up goes back to the grid
+        assert_eq!(next_cap(&steps, Some(1200)), Some(2000));
+        assert_eq!(prev_cap(&steps, Some(1200)), None);
     }
 }
