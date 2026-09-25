@@ -26,8 +26,10 @@ const TEMP_FULL_C: f64 = 74.0;
 /// Power smoothing: long enough to ignore short spikes, short enough to act
 /// before the package heats up (70 → 77 °C in ~15 s at 25 W)
 const POWER_TAU_S: f64 = 10.0;
-/// The demand falls with this time constant: slow steps down, no fan bursts
-const FALL_TAU_S: f64 = 60.0;
+/// The demand falls with this time constant: steps down one level at a time,
+/// no fan bursts when the load pauses. The fan stops ~1 min after a full load
+/// (60 s kept it ~2 min, which felt too long).
+const FALL_TAU_S: f64 = 30.0;
 /// Margin around the midpoint between two levels, against flapping
 const HYSTERESIS_RPM: f64 = 150.0;
 
@@ -290,13 +292,13 @@ mod tests {
         }
         let names: Vec<&str> = LEVELS.iter().map(|l| l.0).rev().collect();
         assert_eq!(levels, names, "every level on the way down, in order");
-        // after one minute at 50 °C, still well above zero
+        // one time constant after a full demand: ~37 % left (e^-1)
         let mut c = Curve::new();
         c.update(1.0, 74.0, None);
-        for _ in 0..60 {
+        for _ in 0..FALL_TAU_S as usize {
             c.update(1.0, 50.0, None);
         }
-        assert!(c.need > 0.3);
+        assert!((0.3..0.45).contains(&c.need), "need {}", c.need);
     }
 
     #[test]
@@ -319,7 +321,7 @@ mod tests {
         for _ in 0..10 {
             c.update(1.0, 50.0, Some(6.0));
         }
-        assert!(c.need > 0.8);
+        assert!(c.need > 0.6);
     }
 
     #[test]

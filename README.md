@@ -34,7 +34,7 @@ need       = max(need_power, need_temp)          clamped to 0..1
 
 - **Power acts first**: heat is coming before the temperature shows it (at 25 W the package goes from 70 to 77 °C in ~15 s). RAPL package power includes the iGPU, which video decode loads.
 - **Temperature corrects**: full speed at 74 °C, under the 75 °C limit where PL1 cuts start.
-- **Up at once, down slowly**: `need` follows a rise immediately and falls with a 60 s time constant. No fan bursts.
+- **Up at once, down slowly**: `need` follows a rise immediately and falls with a 30 s time constant: after a full load the fan steps down one level at a time and stops after ~1 min. No fan bursts when the load pauses.
 - `need × 9540 RPM` maps to the nearest of the 9 fan levels (0–7, `disengaged`), by their measured RPM, with a 150 RPM hysteresis.
 - **Hard limits**, in curve and manual mode: package ≥ 80 °C or a board sensor (SEN) ≥ 70 °C → full speed at once. The kernel powers the machine off at SEN 80 °C.
 - **Safety net**: the daemon sends the level every second with the EC fan watchdog at 10 s. If the daemon dies or hangs, the EC takes the fan back. With no temperature reading, the fan goes back to the EC.
