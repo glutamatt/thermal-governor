@@ -105,7 +105,7 @@ Tests: cap 2000, EPP `performance`, `stress-ng --cpu N`, fixed fan levels, 1 Hz 
   restores them. The learned auto-tuner is abandoned; don't bring it back unasked.
 - **Fan modes** (`/run/thermal-governor/fan-mode`, so every boot starts on `curve`):
   `curve` (daemon), `auto` (EC), `manual` (`hw-tui`). Hard limits (package ≥ 80 °C, SEN ≥
-  70 °C) force full speed in curve and manual mode, then fall slowly like the curve. In
+  70 °C) force full speed in curve and manual mode, then fall slowly (30 s). In
   curve mode the daemon sends the level (and re-arms the EC watchdog, 10 s) every second,
   so a dead daemon gives the fan back to the EC. In manual mode `hw-tui` re-sends its
   level every second with the watchdog still on, and quitting `hw-tui` goes back to curve. Any change here must keep that property: the fan must never stay low on a

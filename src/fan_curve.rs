@@ -3,8 +3,9 @@
 //! The drops to avoid are PL1 cuts by the EC, never seen below 75 °C package
 //! (see the "Power limits" section of the thermal-governor SKILL.md). Two
 //! linear demands, 0.0–1.0, from package power (early: heat is coming) and
-//! from package temperature (the correction). The higher one wins. It rises
-//! at once and falls slowly, then maps to the nearest of the 9 fan levels.
+//! from package temperature (the correction), each on a smoothed input. The
+//! higher one wins and maps to the nearest of the 9 fan levels. The demand
+//! follows the inputs both ways: the fan stops soon after the load ends.
 //!
 //! The daemon runs it; hw-tui switches the mode and shows the state through
 //! two small files in /run.
@@ -26,10 +27,15 @@ const TEMP_FULL_C: f64 = 74.0;
 /// Power smoothing: long enough to ignore short spikes, short enough to act
 /// before the package heats up (70 → 77 °C in ~15 s at 25 W)
 const POWER_TAU_S: f64 = 10.0;
-/// The demand falls with this time constant: steps down one level at a time,
-/// no fan bursts when the load pauses. The fan stops ~1 min after a full load
-/// (60 s kept it ~2 min, which felt too long).
-const FALL_TAU_S: f64 = 30.0;
+/// Temperature smoothing. The package sensor jumps by several °C in 1–2 s
+/// with short bursts of load; each jump would start the fan. PL1 cuts come
+/// from sustained heat, not from these jumps. Replayed on the 1 Hz event logs:
+/// 8 s keeps the fan starts at the rate of the old 30 s fall, and after 10 s
+/// above 72 °C the smoothed demand is the raw one (the power demand covers a
+/// fast heat-up).
+const TEMP_TAU_S: f64 = 8.0;
+/// After a hard limit, full demand falls with this time constant
+const GUARD_FALL_TAU_S: f64 = 30.0;
 /// Margin around the midpoint between two levels, against flapping
 const HYSTERESIS_RPM: f64 = 150.0;
 
@@ -147,7 +153,9 @@ pub struct Decision {
 
 pub struct Curve {
     power_avg: Option<f64>,
-    need: f64,
+    temp_avg: Option<f64>,
+    /// Demand left by a tripped hard limit, falling to 0
+    guard_need: f64,
     level: usize,
 }
 
@@ -161,7 +169,8 @@ impl Curve {
     pub fn new() -> Self {
         Self {
             power_avg: None,
-            need: 0.0,
+            temp_avg: None,
+            guard_need: 0.0,
             level: 0,
         }
     }
@@ -170,24 +179,18 @@ impl Curve {
     /// None when RAPL is unreadable (the temperature demand alone then).
     pub fn update(&mut self, dt: f64, temp_c: f64, power_w: Option<f64>) -> Decision {
         if let Some(p) = power_w {
-            let avg = self.power_avg.get_or_insert(p);
-            *avg += (1.0 - (-dt / POWER_TAU_S).exp()) * (p - *avg);
+            smooth(&mut self.power_avg, p, dt, POWER_TAU_S);
         }
+        let temp_avg = smooth(&mut self.temp_avg, temp_c, dt, TEMP_TAU_S);
         let need_power = self.power_avg.map_or(0.0, |p| ramp(p, POWER_ZERO_W, POWER_FULL_W));
-        let need_temp = ramp(temp_c, TEMP_ZERO_C, TEMP_FULL_C);
-        let raw = need_power.max(need_temp);
+        let need_temp = ramp(temp_avg, TEMP_ZERO_C, TEMP_FULL_C);
+        self.guard_need *= (-dt / GUARD_FALL_TAU_S).exp();
+        let need = need_power.max(need_temp).max(self.guard_need);
 
-        // Rise at once, fall slowly
-        self.need = if raw >= self.need {
-            raw
-        } else {
-            self.need + (1.0 - (-dt / FALL_TAU_S).exp()) * (raw - self.need)
-        };
-
-        self.level = pick_level(self.level, self.need * LEVELS[LEVELS.len() - 1].1);
+        self.level = pick_level(self.level, need * LEVELS[LEVELS.len() - 1].1);
         Decision {
             level: LEVELS[self.level].0,
-            need: self.need,
+            need,
             need_power,
             need_temp,
         }
@@ -195,11 +198,11 @@ impl Curve {
 }
 
 impl Curve {
-    /// A hard limit tripped: full demand, which then falls as slowly as any
-    /// other. Without it, a sensor hovering at the limit would flip the fan
-    /// between off and full speed every second.
+    /// A hard limit tripped: full demand, which then falls slowly. Without
+    /// it, a sensor hovering at the limit would flip the fan between off and
+    /// full speed every second.
     pub fn force_full(&mut self) {
-        self.need = 1.0;
+        self.guard_need = 1.0;
     }
 }
 
@@ -209,6 +212,14 @@ pub fn nearest_level(rpm: f64) -> &'static str {
         .iter()
         .min_by(|a, b| (a.1 - rpm).abs().total_cmp(&(b.1 - rpm).abs()))
         .map_or("0", |l| l.0)
+}
+
+/// Exponential moving average with time constant `tau`, started on the first
+/// value. Returns the new average.
+fn smooth(avg: &mut Option<f64>, x: f64, dt: f64, tau: f64) -> f64 {
+    let a = avg.get_or_insert(x);
+    *a += (1.0 - (-dt / tau).exp()) * (x - *a);
+    *a
 }
 
 /// 0.0 at `zero`, 1.0 at `full`, linear between
@@ -274,31 +285,50 @@ mod tests {
     #[test]
     fn temperature_alone_reaches_full_speed_at_74() {
         let mut c = Curve::new();
-        assert_eq!(c.update(1.0, 74.0, None).level, FULL_SPEED);
+        c.update(1.0, 60.0, None);
+        let mut level = "0";
+        for s in 1..=30 {
+            level = c.update(1.0, 74.0, None).level;
+            if level == FULL_SPEED {
+                assert!(s <= 25, "full speed only after {s} s");
+                break;
+            }
+        }
+        assert_eq!(level, FULL_SPEED);
         assert_eq!(ramp(62.0, TEMP_ZERO_C, TEMP_FULL_C), 0.0);
         assert_eq!(ramp(68.0, TEMP_ZERO_C, TEMP_FULL_C), 0.5);
     }
 
     #[test]
-    fn demand_falls_slowly_one_level_at_a_time() {
+    fn a_short_temperature_spike_does_not_start_the_fan() {
         let mut c = Curve::new();
-        c.update(1.0, 74.0, None);
-        let mut levels = vec![];
-        for _ in 0..600 {
-            let l = c.update(1.0, 50.0, None).level;
-            if levels.last() != Some(&l) {
-                levels.push(l);
+        for _ in 0..30 {
+            c.update(1.0, 60.0, Some(6.0));
+        }
+        for _ in 0..3 {
+            assert_eq!(c.update(1.0, 70.0, Some(6.0)).level, "0");
+        }
+        assert_eq!(c.update(1.0, 61.0, Some(6.0)).level, "0");
+    }
+
+    #[test]
+    fn the_fan_stops_soon_after_the_load_ends() {
+        let mut c = Curve::new();
+        for _ in 0..120 {
+            c.update(1.0, 73.0, Some(24.0));
+        }
+        assert_eq!(c.update(1.0, 73.0, Some(24.0)).level, FULL_SPEED);
+        // The package cools fast once the load is gone
+        let mut stopped = None;
+        for s in 1..=60 {
+            let temp = (73.0 - s as f64).max(58.0);
+            if c.update(1.0, temp, Some(7.0)).level == "0" {
+                stopped = Some(s);
+                break;
             }
         }
-        let names: Vec<&str> = LEVELS.iter().map(|l| l.0).rev().collect();
-        assert_eq!(levels, names, "every level on the way down, in order");
-        // one time constant after a full demand: ~37 % left (e^-1)
-        let mut c = Curve::new();
-        c.update(1.0, 74.0, None);
-        for _ in 0..FALL_TAU_S as usize {
-            c.update(1.0, 50.0, None);
-        }
-        assert!((0.3..0.45).contains(&c.need), "need {}", c.need);
+        let s = stopped.expect("fan still on 60 s after the load");
+        assert!(s <= 20, "fan off only after {s} s");
     }
 
     #[test]
@@ -311,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tripped_guard_falls_slowly_like_the_curve() {
+    fn a_tripped_guard_falls_slowly() {
         let mut c = Curve::new();
         c.update(1.0, 50.0, Some(6.0));
         c.force_full();
@@ -321,7 +351,7 @@ mod tests {
         for _ in 0..10 {
             c.update(1.0, 50.0, Some(6.0));
         }
-        assert!(c.need > 0.6);
+        assert!(c.update(1.0, 50.0, Some(6.0)).need > 0.6);
     }
 
     #[test]
