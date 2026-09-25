@@ -675,7 +675,15 @@ fn observer(stop: &AtomicBool) {
     // settings: if a restore write failed, trusting the intent would make the
     // next tick see a "change" and overwrite the saved settings with the
     // failed state.
-    let mut last_settings = Settings::from_hw(&dirs).or(saved);
+    let mut last_settings = match (Settings::from_hw(&dirs), saved) {
+        // A file saved before the profile was persisted: keep its None in the
+        // baseline, so the first tick sees the profile as a change and saves it
+        (Some(hw), Some(saved)) if saved.platform_profile.is_none() => Some(Settings {
+            platform_profile: None,
+            ..hw
+        }),
+        (hw, saved) => hw.or(saved),
+    };
 
     prune_events();
 
