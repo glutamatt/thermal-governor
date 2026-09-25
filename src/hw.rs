@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Instant;
 
 // =============================================================================
@@ -20,11 +21,17 @@ const THROTTLE_TIME_PATH: &str =
     "/sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_total_time_ms";
 const RAPL_ENERGY_PATH: &str = "/sys/class/powercap/intel-rapl:0/energy_uj";
 const RAPL_MAX_ENERGY_PATH: &str = "/sys/class/powercap/intel-rapl:0/max_energy_range_uj";
+// The MSR interface (intel-rapl:0) shows 64 W; the firmware's lower PL1 lives here
+const RAPL_MMIO_PL1_PATH: &str = "/sys/class/powercap/intel-rapl-mmio:0/constraint_0_power_limit_uw";
+const PLATFORM_PROFILE_PATH: &str = "/sys/firmware/acpi/platform_profile";
+const PLATFORM_PROFILE_CHOICES_PATH: &str = "/sys/firmware/acpi/platform_profile_choices";
 const BATTERY_STATUS_PATH: &str = "/sys/class/power_supply/BAT0/status";
 const BATTERY_POWER_PATH: &str = "/sys/class/power_supply/BAT0/power_now";
 
 // Above this, a RAPL delta is a counter reset or a suspend/resume gap, not power
 const RAPL_MAX_PLAUSIBLE_W: f64 = 500.0;
+// A shorter interval gives a noisy power value (the counter has a ~1 ms step)
+const RAPL_MIN_INTERVAL_S: f64 = 0.2;
 
 // =============================================================================
 // sysfs helpers
@@ -57,6 +64,31 @@ pub fn find_temp_sensor() -> Option<PathBuf> {
 
 pub fn cpu_temp(sensor: &Path) -> Option<f64> {
     read_i64(sensor).map(|t| t as f64 / 1000.0)
+}
+
+/// Board sensors SEN1, SEN2, … (thermal zones). Their critical trip is 80 °C,
+/// where the kernel powers the machine off.
+pub fn find_sen_sensors() -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir("/sys/class/thermal/") else {
+        return Vec::new();
+    };
+    let mut sensors: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| {
+            read_string(e.path().join("type")).is_some_and(|t| t.starts_with("SEN"))
+        })
+        .map(|e| e.path().join("temp"))
+        .collect();
+    sensors.sort();
+    sensors
+}
+
+/// Hottest board sensor among those that read; None if none does
+pub fn max_sen_temp(sensors: &[PathBuf]) -> Option<f64> {
+    sensors
+        .iter()
+        .filter_map(|p| cpu_temp(p))
+        .reduce(f64::max)
 }
 
 // =============================================================================
@@ -129,6 +161,28 @@ fn parse_fan_level(content: &str) -> Option<String> {
 /// Same values as `read_fan_level`. Fails silently when fan control is off.
 pub fn set_fan_level(level: &str) {
     let _ = fs::write(FAN_CONTROL, format!("level {level}"));
+}
+
+/// EC fan watchdog: when no fan command comes for `secs`, the EC takes the
+/// fan back (auto). 0 turns it off.
+pub fn set_fan_watchdog(secs: u32) {
+    let _ = fs::write(FAN_CONTROL, format!("watchdog {secs}"));
+}
+
+/// Reload thinkpad_acpi with fan_control=1. `modprobe thinkpad_acpi
+/// fan_control=1` alone does nothing when the module is already loaded, which
+/// it is at boot. install.sh sets the option in modprobe.d, so after a reboot
+/// this is not needed.
+pub fn enable_fan_control() -> bool {
+    if fan_control_enabled() {
+        return true;
+    }
+    let reloaded = Command::new("sh")
+        .arg("-c")
+        .arg("modprobe -r thinkpad_acpi && modprobe thinkpad_acpi fan_control=1")
+        .status()
+        .is_ok_and(|s| s.success());
+    reloaded && fan_control_enabled()
 }
 
 // =============================================================================
@@ -212,6 +266,36 @@ pub fn set_epp(dirs: &[PathBuf], epp: &str) {
     for d in dirs {
         let _ = fs::write(d.join("energy_performance_preference"), epp);
     }
+}
+
+// =============================================================================
+// Platform profile + PL1
+// =============================================================================
+
+/// Firmware profile: "low-power", "balanced" or "performance". It sets PL1
+/// (10 / 15 / 40 W here), so it decides whether the CPU can hold its cap.
+pub fn has_platform_profile() -> bool {
+    Path::new(PLATFORM_PROFILE_PATH).exists()
+}
+
+pub fn read_platform_profile() -> Option<String> {
+    read_string(PLATFORM_PROFILE_PATH)
+}
+
+pub fn set_platform_profile(profile: &str) {
+    let _ = fs::write(PLATFORM_PROFILE_PATH, profile);
+}
+
+pub fn platform_profile_choices() -> Vec<String> {
+    read_string(PLATFORM_PROFILE_CHOICES_PATH)
+        .map(|s| s.split_whitespace().map(String::from).collect())
+        .unwrap_or_default()
+}
+
+/// Package PL1 that actually applies, in W. The EC lowers it (e.g. 40 → 12 W)
+/// when the machine is hot, even in the performance profile.
+pub fn read_pl1_w() -> Option<f64> {
+    read_i64(RAPL_MMIO_PL1_PATH).map(|uw| uw as f64 / 1_000_000.0)
 }
 
 // =============================================================================
@@ -328,10 +412,14 @@ impl RaplMeter {
         }
     }
 
-    /// None when the counter is unreadable or the delta is not plausible
+    /// None when the counter is unreadable, the delta is not plausible, or
+    /// the last sample is too recent (it is then kept as the reference)
     pub fn sample(&mut self) -> Option<f64> {
+        let dt = self.prev_time.elapsed().as_secs_f64();
+        if dt < RAPL_MIN_INTERVAL_S {
+            return None;
+        }
         let now = read_rapl_energy_uj();
-        let dt = self.prev_time.elapsed().as_secs_f64().max(0.001);
         let prev = std::mem::replace(&mut self.prev_uj, now);
         self.prev_time = Instant::now();
         let delta = energy_delta_uj(prev?, now?, self.max_range_uj)?;

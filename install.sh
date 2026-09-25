@@ -6,6 +6,7 @@ BIN_PATH="/usr/local/bin/$BIN_NAME"
 SERVICE_NAME="thermal-governor"
 SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 STATE_DIR="/var/lib/thermal-governor"
+MODPROBE_CONF="/etc/modprobe.d/thinkpad_acpi-fan-control.conf"
 
 # Colors
 RED='\033[0;31m'
@@ -48,6 +49,21 @@ info "Installing binary to $BIN_PATH"
 cp "$BIN_SRC" "$BIN_PATH"
 chmod 755 "$BIN_PATH"
 
+# The fan curve needs fan_control=1 from boot. Loading the option at boot
+# avoids a module reload, which renumbers the thinkpad hwmon node.
+MODPROBE_LINE="options thinkpad_acpi fan_control=1"
+if [ "$(cat "$MODPROBE_CONF" 2>/dev/null)" != "$MODPROBE_LINE" ]; then
+    info "Enabling thinkpad_acpi fan_control at boot: $MODPROBE_CONF"
+    echo "$MODPROBE_LINE" > "$MODPROBE_CONF"
+    # thinkpad_acpi loads from the initramfs, which has its own copy of modprobe.d
+    if command -v update-initramfs >/dev/null; then
+        info "Updating the initramfs"
+        update-initramfs -u
+    else
+        warn "update-initramfs not found: rebuild the initramfs, or the option may be ignored at boot"
+    fi
+fi
+
 # Create state directory
 info "Creating state directory: $STATE_DIR"
 mkdir -p "$STATE_DIR"
@@ -56,7 +72,7 @@ mkdir -p "$STATE_DIR"
 info "Installing systemd service"
 cat > "$SERVICE_PATH" <<'EOF'
 [Unit]
-Description=Thermal settings keeper and event logger
+Description=Fan curve, thermal settings keeper and event logger
 After=multi-user.target
 
 [Service]

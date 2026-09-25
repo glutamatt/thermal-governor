@@ -63,6 +63,10 @@ Tests: cap 2000, EPP `performance`, `stress-ng --cpu N`, fixed fan levels, 1 Hz 
   runs. **No cut was ever seen below 75 °C package.**
 - **A cut costs a lot**: PL1 stays at 12 W until the package is back to ~58–60 °C
   (~50 s with the fan at full speed), then returns to 40 W on its own.
+- **Fan levels** (idle, laptop flat on the desk, fan1 / fan2 RPM): 0 → 0 / 0,
+  1 → 3985 / 3480, 2 → 4839 / 4124, 3 → 5272 / 4765, 4 → 5790 / 5594, 5 → 6438 / 5924,
+  6 → 6849 / 6338, 7 → 7537 / 7009, `disengaged` → ~9540 / 8900. Steps are regular
+  (~450–700 RPM) up to 7; `disengaged` adds ~2000 RPM.
 - **Fan vs load at cap 2000** (`performance` profile):
 
   | Load | Fan | Result |
@@ -95,21 +99,28 @@ Tests: cap 2000, EPP `performance`, `stress-ng --cpu N`, fixed fan levels, 1 Hz 
 
 ## Working on this
 
-- **Manual tuning is the product.** The auto-tuner is abandoned, and so is the idea of
-  collecting data for one. `hw-tui` is the control surface. The daemon only keeps cap +
-  EPP across reboots and writes an event log (CSV) for post-mortem. It runs no control
-  loop. Don't reintroduce automatic nudging without saying so explicitly.
-- **The fan level is never persisted.** The daemon sets the fan to auto at start and on
-  stop; manual levels last one `hw-tui` session. This is deliberate: a manual level
-  restored at boot, with nobody watching, could leave the fan off under load.
-- **`fan_control=1`**: at boot `thinkpad_acpi` is loaded without it. `hw-tui` reloads the
-  module to enable it, which gives the thinkpad hwmon node a new number — `FanSensor` in
-  `src/hw.rs` re-discovers the node when a read fails.
+- **The daemon runs one control loop: the fan curve** (`src/fan_curve.rs`), asked for on
+  2026-09-25. Goal: zero max-frequency drops with the least fan RPM. It never touches the
+  cap, EPP or profile on its own: those stay manual (`hw-tui`), the daemon only saves and
+  restores them. The learned auto-tuner is abandoned; don't bring it back unasked.
+- **Fan modes** (`/run/thermal-governor/fan-mode`, so every boot starts on `curve`):
+  `curve` (daemon), `auto` (EC), `manual` (`hw-tui`). Hard limits (package ≥ 80 °C, SEN ≥
+  70 °C) force full speed in curve and manual mode, then fall slowly like the curve. In
+  curve mode the daemon sends the level (and re-arms the EC watchdog, 10 s) every second,
+  so a dead daemon gives the fan back to the EC. In manual mode `hw-tui` re-sends its
+  level every second with the watchdog still on, and quitting `hw-tui` goes back to curve. Any change here must keep that property: the fan must never stay low on a
+  machine that heats up with nobody watching.
+- **The fan level is never persisted** in `settings.json`: a manual level restored at
+  boot, with nobody watching, could leave the fan off under load.
+- **`fan_control=1`**: `install.sh` sets it in modprobe.d for boot. Without it (before the
+  first reboot after install), the daemon and `hw-tui` reload `thinkpad_acpi`, which gives
+  the thinkpad hwmon node a new number — `FanSensor` in `src/hw.rs` re-discovers the node
+  when a read fails.
 - All sysfs access lives in `src/hw.rs`, shared by both binaries. Put new hardware reads
   there, not in one binary.
 - `thermal-governor.service` is installed and running on the dev machine itself. A
   `cargo build` is harmless, but `install.sh` restarts the live service and discards the
-  5-minute rolling buffer. A restart keeps cap and EPP (restored from `settings.json`)
-  but resets the fan to auto.
+  5-minute rolling buffer. A restart keeps profile, cap and EPP (restored from
+  `settings.json`) and the fan mode (in `/run`).
 - The event CSVs in `/var/lib/thermal-governor/events/` are the user's log, not build
   output. Don't clear them to "clean up".

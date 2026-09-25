@@ -5,6 +5,7 @@ BIN_PATH="/usr/local/bin/thermal-governor"
 SERVICE_NAME="thermal-governor"
 SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 STATE_DIR="/var/lib/thermal-governor"
+MODPROBE_CONF="/etc/modprobe.d/thinkpad_acpi-fan-control.conf"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -33,16 +34,25 @@ fi
 # Remove files
 [ -f "$SERVICE_PATH" ] && info "Removing service file" && rm -f "$SERVICE_PATH"
 [ -f "$BIN_PATH" ]     && info "Removing binary"       && rm -f "$BIN_PATH"
+if [ -f "$MODPROBE_CONF" ]; then
+    info "Removing $MODPROBE_CONF"
+    rm -f "$MODPROBE_CONF"
+    # the initramfs has its own copy of modprobe.d
+    command -v update-initramfs >/dev/null && update-initramfs -u
+fi
+rm -rf /run/thermal-governor
 
 systemctl daemon-reload
 
 # Reset what the daemon and hw-tui change: cap (each core to its own max),
-# EPP (firmware default) and fan (EC-managed)
+# EPP (firmware default), platform profile (firmware default) and fan (EC)
 info "Resetting CPU and fan to defaults..."
 for d in /sys/devices/system/cpu/cpu*/cpufreq/; do
     cat "${d}cpuinfo_max_freq" > "${d}scaling_max_freq" 2>/dev/null || true
     echo default > "${d}energy_performance_preference" 2>/dev/null || true
 done
+echo balanced > /sys/firmware/acpi/platform_profile 2>/dev/null || true
+echo "watchdog 0" > /proc/acpi/ibm/fan 2>/dev/null || true
 echo "level auto" > /proc/acpi/ibm/fan 2>/dev/null || true
 
 echo ""

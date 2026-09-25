@@ -21,7 +21,8 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
-use thermal_governor::clock::LocalTime;
+use thermal_governor::clock::{self, LocalTime};
+use thermal_governor::fan_curve::{self, FanMode, Status};
 use thermal_governor::hw::{self, FanSensor};
 
 // =============================================================================
@@ -98,12 +99,14 @@ impl TimeSeries {
 // Hardware state helpers
 // =============================================================================
 
-/// Current fan state → (auto, level index)
-fn read_fan_state() -> (bool, usize) {
-    match hw::read_fan_level().and_then(|lvl| FAN_LEVELS.iter().position(|&l| l == lvl)) {
-        Some(pos) => (false, pos),
-        None => (true, 4), // "auto" or unreadable
-    }
+/// Index in FAN_LEVELS of the level the fan runs at now; None on "auto"
+fn current_fan_level_idx() -> Option<usize> {
+    hw::read_fan_level().and_then(|lvl| FAN_LEVELS.iter().position(|&l| l == lvl))
+}
+
+/// The daemon's last status, if it is recent enough to mean it is running
+fn fresh_fan_status() -> Option<Status> {
+    Status::read().filter(|s| clock::unix_now().saturating_sub(s.updated) <= 3)
 }
 
 /// FREQ_CAP_MIN, +200, +400, … then `top`, the highest core frequency
@@ -148,8 +151,10 @@ struct App {
     stress_idx: usize,
     cap_steps: Vec<u32>,
     epp_idx: usize,
+    // Level set by hand, used in manual mode only
     fan_level_idx: usize,
-    fan_auto: bool,
+    fan_mode: FanMode,
+    fan_status: Option<Status>,
     stress_children: Vec<Child>,
 
     recording: bool,
@@ -178,6 +183,7 @@ struct App {
     // change them while hw-tui runs
     cur_cap: Option<u32>,
     cur_epp: String,
+    cur_profile: String,
     cur_throttle_rate: f64,
     cur_cpu: f64,
     cur_power_w: f64,
@@ -197,7 +203,15 @@ impl App {
         let cur_cap = hw::read_freq_cap(&dirs);
         // Fallback on the current cap: never offer a top below what is set now
         let cap_top = hw::max_hw_freq(&dirs).or(cur_cap).unwrap_or(FREQ_CAP_MIN);
-        let (fan_auto, fan_level_idx) = read_fan_state();
+        let fan_level_idx = current_fan_level_idx().unwrap_or(0);
+        // Manual mode left over with the fan on auto (daemon restarted, or
+        // the EC watchdog took the fan back): there is no hand-set level to
+        // keep, and re-applying index 0 would turn the fan off
+        let mut fan_mode = FanMode::read();
+        if fan_mode == FanMode::Manual && current_fan_level_idx().is_none() {
+            fan_mode = FanMode::Curve;
+            let _ = fan_mode.write();
+        }
 
         // detect current EPP index
         let epp_idx = EPP_VALUES
@@ -221,7 +235,8 @@ impl App {
             cap_steps: cap_steps(cap_top),
             epp_idx,
             fan_level_idx,
-            fan_auto,
+            fan_mode,
+            fan_status: fresh_fan_status(),
             stress_children: Vec::new(),
 
             recording: false,
@@ -247,6 +262,7 @@ impl App {
             cur_fan2: 0,
             cur_cap,
             cur_epp: epp,
+            cur_profile: hw::read_platform_profile().unwrap_or_default(),
             cur_throttle_rate: 0.0,
             cur_cpu: 0.0,
             cur_power_w: 0.0,
@@ -327,6 +343,16 @@ impl App {
         self.freq_max.push(elapsed, self.cur_freq_max as f64);
         self.cur_cap = hw::read_freq_cap(&self.cpufreq_dirs);
         self.cur_epp = hw::read_epp(&self.cpufreq_dirs).unwrap_or_default();
+        self.cur_profile = hw::read_platform_profile().unwrap_or_default();
+
+        // Fan mode: the daemon may have changed it (hard limit in manual mode)
+        self.fan_mode = FanMode::read();
+        self.fan_status = fresh_fan_status();
+        if self.fan_mode == FanMode::Manual {
+            // Again every second: the daemon may have sent one last curve
+            // level right after the switch to manual
+            hw::set_fan_level(FAN_LEVELS[self.fan_level_idx]);
+        }
 
         // CSV
         if self.recording {
@@ -457,13 +483,15 @@ impl App {
     fn handle_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
-            KeyCode::Up => self.fan_up(),
-            KeyCode::Down => self.fan_down(),
+            KeyCode::Up => self.step_fan(true),
+            KeyCode::Down => self.step_fan(false),
             KeyCode::Right => self.step_cap(true),
             KeyCode::Left => self.step_cap(false),
             KeyCode::Char('p') => self.cycle_epp(),
             KeyCode::Char('r') => self.toggle_recording(),
-            KeyCode::Char('a') => self.toggle_fan_auto(),
+            KeyCode::Char('a') => self.set_fan_mode(FanMode::Auto),
+            KeyCode::Char('c') => self.set_fan_mode(FanMode::Curve),
+            KeyCode::Char('o') => self.cycle_profile(),
             KeyCode::Char('k') => {
                 let next = (self.stress_idx + 1).min(STRESS_LEVELS.len() - 1);
                 if next != self.stress_idx {
@@ -480,42 +508,80 @@ impl App {
         }
     }
 
-    fn toggle_fan_auto(&mut self) {
-        if self.fan_auto {
-            let level = FAN_LEVELS[self.fan_level_idx];
-            hw::set_fan_level(level);
-            self.fan_auto = false;
-            self.log_event(format!("🌀 Fan → manual level {level}"));
+    /// Curve and auto are the daemon's job; hw-tui writes the mode file
+    fn set_fan_mode(&mut self, mode: FanMode) {
+        if let Err(e) = mode.write() {
+            self.log_event(format!("❌ Cannot write the fan mode: {e}"));
+            return;
+        }
+        self.fan_mode = mode;
+        match mode {
+            FanMode::Auto => {
+                // Also directly: works without the daemon
+                hw::set_fan_level("auto");
+                self.log_event("🌀 Fan → auto (EC)".into());
+            }
+            FanMode::Curve if fresh_fan_status().is_none() => {
+                // Nobody would drive the fan: give it to the EC until the daemon runs
+                hw::set_fan_level("auto");
+                self.log_event("⚠️ Fan → curve, but the daemon is not running: EC for now".into());
+            }
+            _ => self.log_event(format!("🌀 Fan → {}", mode.as_str())),
+        }
+    }
+
+    /// ↑/↓ take the fan by hand, from the level it runs at now
+    fn step_fan(&mut self, up: bool) {
+        let from = if self.fan_mode == FanMode::Manual {
+            self.fan_level_idx
         } else {
-            hw::set_fan_level("auto");
-            self.fan_auto = true;
-            self.log_event("🌀 Fan → auto (EC)".into());
+            // On EC auto the level reads "auto": start from the level with
+            // the closest speed, not from 0
+            current_fan_level_idx().unwrap_or_else(|| {
+                let level = fan_curve::nearest_level(self.cur_fan as f64);
+                FAN_LEVELS.iter().position(|&l| l == level).unwrap_or(0)
+            })
+        };
+        let to = if up {
+            (from + 1).min(FAN_LEVELS.len() - 1)
+        } else {
+            from.saturating_sub(1)
+        };
+        if let Err(e) = FanMode::Manual.write() {
+            self.log_event(format!("❌ Cannot write the fan mode: {e}"));
+            return;
         }
+        self.fan_mode = FanMode::Manual;
+        self.fan_level_idx = to;
+        hw::set_fan_level(FAN_LEVELS[to]);
+        self.log_event(format!("🌀 Fan → manual level {}", FAN_LEVELS[to]));
     }
 
-    fn fan_up(&mut self) {
-        let next = (self.fan_level_idx + 1).min(FAN_LEVELS.len() - 1);
-        if next != self.fan_level_idx {
-            self.fan_level_idx = next;
-            let level = FAN_LEVELS[next];
-            hw::set_fan_level(level);
-            self.fan_auto = false;
-            self.log_event(format!("🌀 Fan → level {level}"));
+    /// The profile sets PL1: 10 / 15 / 40 W here. The daemon saves it.
+    fn cycle_profile(&mut self) {
+        let choices = hw::platform_profile_choices();
+        if choices.is_empty() {
+            self.log_event("❌ No platform profile on this machine".into());
+            return;
         }
-    }
-
-    fn fan_down(&mut self) {
-        if self.fan_level_idx > 0 {
-            self.fan_level_idx -= 1;
-            let level = FAN_LEVELS[self.fan_level_idx];
-            hw::set_fan_level(level);
-            self.fan_auto = false;
-            self.log_event(format!("🌀 Fan → level {level}"));
-        }
+        let next = choices
+            .iter()
+            .position(|c| *c == self.cur_profile)
+            .map_or(0, |i| (i + 1) % choices.len());
+        hw::set_platform_profile(&choices[next]);
+        self.cur_profile = hw::read_platform_profile().unwrap_or_default();
+        self.log_event(format!("⚙️ Profile → {}", self.cur_profile));
     }
 
     fn cleanup(&mut self) {
         self.stop_stress();
+        // A hand-set level lasts while hw-tui runs: nobody watches it after
+        if FanMode::read() == FanMode::Manual {
+            let _ = FanMode::Curve.write();
+            if fresh_fan_status().is_none() {
+                hw::set_fan_level("auto");
+            }
+        }
     }
 }
 
@@ -572,6 +638,17 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     spans.push(Span::styled(
         format!("{epp_emoji} epp: {}", app.cur_epp),
         Style::default().fg(Color::Yellow),
+    ));
+    // Not "performance" means PL1 at 15 W or less: drops under load
+    let profile_color = if app.cur_profile == "performance" {
+        Color::Green
+    } else {
+        Color::Red
+    };
+    spans.push(Span::raw("   "));
+    spans.push(Span::styled(
+        format!("⚙️ profile: {}", app.cur_profile),
+        Style::default().fg(profile_color),
     ));
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -1016,14 +1093,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled(format!("{}", app.cur_fan2), Style::default().fg(Color::Gray)),
         Span::raw(")"),
         Span::raw("   🌀 "),
-        Span::styled(
-            if app.fan_auto {
-                "auto".to_string()
-            } else {
-                format!("lvl {}", FAN_LEVELS[app.fan_level_idx])
-            },
-            Style::default().fg(if app.fan_auto { Color::Green } else { Color::Yellow }).add_modifier(Modifier::BOLD),
-        ),
+        fan_mode_span(app),
         Span::raw("   🔌 "),
         Span::styled(
             format!("{:.1}W", app.cur_power_w),
@@ -1035,6 +1105,33 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::DarkGray).fg(Color::White)),
         area,
     );
+}
+
+fn fan_mode_span(app: &App) -> Span<'static> {
+    let (text, color) = match (app.fan_mode, &app.fan_status) {
+        (FanMode::Curve, None) => ("curve (daemon off!)".to_string(), Color::Red),
+        (FanMode::Curve, Some(st)) => match &st.guard {
+            Some(why) => (format!("curve FULL ({why})"), Color::Red),
+            None => (
+                format!(
+                    "curve lvl {} need {:.2}",
+                    st.level.as_deref().unwrap_or("-"),
+                    st.need
+                ),
+                Color::Green,
+            ),
+        },
+        (FanMode::Auto, _) => ("auto (EC)".to_string(), Color::Cyan),
+        (FanMode::Manual, None) => (
+            format!("manual lvl {} (no daemon: no hard limits)", FAN_LEVELS[app.fan_level_idx]),
+            Color::Red,
+        ),
+        (FanMode::Manual, Some(_)) => (
+            format!("manual lvl {}", FAN_LEVELS[app.fan_level_idx]),
+            Color::Yellow,
+        ),
+    };
+    Span::styled(text, Style::default().fg(color).add_modifier(Modifier::BOLD))
 }
 
 fn draw_events(frame: &mut Frame, area: Rect, app: &App) {
@@ -1066,12 +1163,16 @@ fn draw_help(frame: &mut Frame, area: Rect, _app: &App) {
         Span::styled(" 🌀 [", Style::default().fg(Color::DarkGray)),
         Span::styled("↑↓", Style::default().fg(Color::Cyan)),
         Span::styled("] fan [", Style::default().fg(Color::DarkGray)),
+        Span::styled("c", Style::default().fg(Color::Cyan)),
+        Span::styled("] curve [", Style::default().fg(Color::DarkGray)),
         Span::styled("a", Style::default().fg(Color::Cyan)),
         Span::styled("] auto   📏 [", Style::default().fg(Color::DarkGray)),
         Span::styled("←→", Style::default().fg(Color::Cyan)),
         Span::styled("] freq cap   ⚡ [", Style::default().fg(Color::DarkGray)),
         Span::styled("p", Style::default().fg(Color::Cyan)),
-        Span::styled("] epp   🏋️ [", Style::default().fg(Color::DarkGray)),
+        Span::styled("] epp   ⚙️ [", Style::default().fg(Color::DarkGray)),
+        Span::styled("o", Style::default().fg(Color::Cyan)),
+        Span::styled("] profile   🏋️ [", Style::default().fg(Color::DarkGray)),
         Span::styled("jk", Style::default().fg(Color::Cyan)),
         Span::styled("] stress   💾 [", Style::default().fg(Color::DarkGray)),
         Span::styled("r", Style::default().fg(Color::Cyan)),
@@ -1126,17 +1227,10 @@ fn main() -> io::Result<()> {
     let mut startup_events: Vec<String> = Vec::new();
     if !hw::fan_control_enabled() {
         startup_events.push("🌀 Enabling fan control (reloading thinkpad_acpi)...".into());
-        let out = Command::new("sh")
-            .arg("-c")
-            .arg("modprobe -r thinkpad_acpi && modprobe thinkpad_acpi fan_control=1")
-            .output();
-        match out {
-            Ok(o) if o.status.success() && hw::fan_control_enabled() => {
-                startup_events.push("🌀 Fan control enabled".into());
-            }
-            _ => {
-                startup_events.push("⚠️ Cannot enable fan control — run as root".into());
-            }
+        if hw::enable_fan_control() {
+            startup_events.push("🌀 Fan control enabled".into());
+        } else {
+            startup_events.push("⚠️ Cannot enable fan control — run as root".into());
         }
     } else {
         startup_events.push("🌀 Fan control enabled".into());
@@ -1177,7 +1271,7 @@ fn main() -> io::Result<()> {
     res?;
     restored?;
 
-    println!("Exited. Settings left unchanged.");
+    println!("Exited. Profile, cap and EPP left unchanged; a manual fan level goes back to the curve.");
     if let Some(path) = &app.csv_path {
         if app.recording {
             println!("Recording saved: {path}");
