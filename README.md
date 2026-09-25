@@ -153,7 +153,7 @@ Example output:
 
 ## Hardware characterization
 
-`hw-characterize.sh` sweeps power profiles × frequency caps × stress levels and writes a CSV. `hw-plot.py` turns it into charts. It needs `stress-ng` and `power-profiles-daemon`. The findings behind this project's design are in `.claude/skills/thermal-governor/SKILL.md`.
+`hw-characterize.sh` sweeps power profiles × frequency caps × stress levels and writes a CSV. `hw-plot.py` turns it into charts. It needs `stress-ng` and `power-profiles-daemon`. `hw-dptf-policy.py` decodes the firmware's thermal policy (DPTF data vault): power limits per mode and the sensor thresholds behind them. The findings behind this project's design are in `.claude/skills/thermal-governor/SKILL.md`.
 
 ## Requirements
 
