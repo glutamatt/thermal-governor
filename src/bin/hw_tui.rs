@@ -990,12 +990,12 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
             format!("{}", app.cur_freq_min),
             Style::default().fg(Color::Cyan),
         ),
-        Span::styled("/", Style::default().fg(Color::DarkGray)),
+        Span::styled("/", Style::default().fg(Color::Gray)),
         Span::styled(
             format!("{}", app.cur_freq_avg),
             Style::default().fg(Color::Yellow),
         ),
-        Span::styled("/", Style::default().fg(Color::DarkGray)),
+        Span::styled("/", Style::default().fg(Color::Gray)),
         Span::styled(
             format!("{} MHz", app.cur_freq_max),
             Style::default().fg(Color::Red),
@@ -1011,9 +1011,9 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(fan_color),
         ),
         Span::raw(" ("),
-        Span::styled(format!("{}", app.cur_fan1), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{}", app.cur_fan1), Style::default().fg(Color::Gray)),
         Span::raw("/"),
-        Span::styled(format!("{}", app.cur_fan2), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{}", app.cur_fan2), Style::default().fg(Color::Gray)),
         Span::raw(")"),
         Span::raw("   🌀 "),
         Span::styled(
