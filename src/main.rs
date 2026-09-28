@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fmt;
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -17,6 +18,7 @@ use thermal_governor::hw::{self, FanSensor};
 
 const DATA_DIR: &str = "/var/lib/thermal-governor";
 const EVENTS_DIR: &str = "/var/lib/thermal-governor/events";
+const LOG_DIR: &str = "/var/lib/thermal-governor/log";
 const SETTINGS_FILE: &str = "/var/lib/thermal-governor/settings.json";
 
 const BUFFER_CAPACITY: usize = 300; // 5 min at 1Hz
@@ -29,6 +31,8 @@ const PROFILE_SETTLE_SECS: u64 = 5;
 
 // Retention: keep only the newest N event CSVs (~30 KB each)
 const EVENTS_MAX_FILES: usize = 1000;
+// Retention of the continuous log: ~10 MB a day at 1 Hz
+const LOG_KEEP_DAYS: usize = 30;
 
 // The EC takes the fan back if the curve stops sending levels for this long
 const FAN_WATCHDOG_SECS: u32 = 10;
@@ -492,6 +496,106 @@ fn prune_events() {
 }
 
 // =============================================================================
+// Continuous log (every sample, one CSV per local day)
+// =============================================================================
+
+/// Every sample, with the columns of the event CSVs: the raw data to fit and
+/// replay a thermal model. The event CSVs stay: they point at the moments
+/// that matter.
+struct DailyLog {
+    /// Day of the open file, `YYYY-MM-DD`
+    day: Option<String>,
+    writer: Option<BufWriter<File>>,
+    /// Report a write error once, not every second
+    failed: bool,
+}
+
+impl DailyLog {
+    fn new() -> Self {
+        Self {
+            day: None,
+            writer: None,
+            failed: false,
+        }
+    }
+
+    fn write(&mut self, sample: &Sample) {
+        let now = LocalTime::now();
+        let day = now.date();
+        if self.day.as_deref() != Some(day.as_str()) {
+            self.writer = open_log_file(Path::new(LOG_DIR), &day, &now.time().replace(':', "-"))
+                .map_err(|e| self.report(&format!("Cannot open the log for {day}: {e}")))
+                .ok();
+            self.day = Some(day);
+            prune_log(Path::new(LOG_DIR), LOG_KEEP_DAYS);
+        }
+        let Some(w) = &mut self.writer else { return };
+        match writeln!(w, "{}", sample.to_csv_row()).and_then(|()| w.flush()) {
+            Ok(()) => self.failed = false,
+            Err(e) => self.report(&format!("Write failed: {e}")),
+        }
+    }
+
+    fn report(&mut self, msg: &str) {
+        if !self.failed {
+            log("log", msg);
+            self.failed = true;
+        }
+    }
+}
+
+/// `<day>.csv`, appended after a restart. If that file has other columns (a
+/// daemon update changed them), a new `<day>T<HH-MM-SS>.csv`: one file never
+/// mixes two formats.
+fn open_log_file(dir: &Path, day: &str, time: &str) -> std::io::Result<BufWriter<File>> {
+    fs::create_dir_all(dir)?;
+    let mut path = dir.join(format!("{day}.csv"));
+    if let Ok(f) = File::open(&path) {
+        let mut header = String::new();
+        BufReader::new(f).read_line(&mut header)?;
+        if header.trim_end() != Sample::csv_header() {
+            path = dir.join(format!("{day}T{time}.csv"));
+        }
+    }
+    let file = OpenOptions::new().create(true).append(true).open(&path)?;
+    let mut w = BufWriter::new(file);
+    if w.get_ref().metadata()?.len() == 0 {
+        writeln!(w, "{}", Sample::csv_header())?;
+    }
+    log("log", &format!("Logging every sample to {}", path.display()));
+    Ok(w)
+}
+
+/// Keep the files of the newest `keep_days` days. The day is the start of the
+/// file name, so a clock change or a copied file cannot confuse it.
+fn prune_log(dir: &Path, keep_days: usize) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let files: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "csv"))
+        .filter_map(|p| Some((p.file_name()?.to_str()?.get(..10)?.to_string(), p)))
+        .collect();
+    let mut days: Vec<&str> = files.iter().map(|(d, _)| d.as_str()).collect();
+    days.sort_unstable();
+    days.dedup();
+    // Sorted: the oldest day kept is `keep_days` from the end
+    let Some(&oldest_kept) = days.get(days.len().saturating_sub(keep_days)) else {
+        return;
+    };
+    for (day, path) in &files {
+        if day.as_str() < oldest_kept {
+            match fs::remove_file(path) {
+                Ok(()) => log("log", &format!("Pruned {}", path.display())),
+                Err(e) => log("log", &format!("Cannot prune {}: {e}", path.display())),
+            }
+        }
+    }
+}
+
+// =============================================================================
 // Fan driver: applies the mode from hw-tui (curve by default)
 // =============================================================================
 
@@ -769,6 +873,7 @@ fn observer(stop: &AtomicBool) {
     let mut detector = EventDetector::new();
     let mut fan_driver = FanDriver::new();
     let mut pl1_watch = Pl1Watch::new();
+    let mut daily_log = DailyLog::new();
     let mut minute = MinuteStats::default();
     let mut prev_tick = Instant::now();
     let mut tick: u64 = 0;
@@ -859,6 +964,7 @@ fn observer(stop: &AtomicBool) {
             fan_need: fan_status.need,
         };
         minute.record(&sample);
+        daily_log.write(&sample);
 
         // --- Push to rolling buffer ---
         if buffer.len() >= BUFFER_CAPACITY {
@@ -931,6 +1037,7 @@ fn main() {
     eprintln!("================================================");
     eprintln!("  Settings: {SETTINGS_FILE}");
     eprintln!("  Events:   {EVENTS_DIR}/");
+    eprintln!("  Log:      {LOG_DIR}/ (every sample, {LOG_KEEP_DAYS} days)");
     eprintln!("  Poll: {}ms  Buffer: {} samples (5 min)", POLL_MS, BUFFER_CAPACITY);
     eprintln!("================================================\n");
 
@@ -1082,6 +1189,72 @@ mod tests {
         let mut d = EventDetector::new();
         assert_eq!(d.detect(&sample(60.0, 0.0, 5.0)), vec![EventType::Throttle]);
         assert!(d.detect(&sample(60.0, 0.0, 5.0)).is_empty());
+    }
+
+    /// Empty directory for one test, under the system temp dir
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tg-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn csv_files(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn daily_log_appends_after_a_restart() {
+        let dir = test_dir("log-append");
+        for _ in 0..2 {
+            let mut w = open_log_file(&dir, "2026-09-28", "10-00-00").unwrap();
+            writeln!(w, "{}", sample(60.0, 0.0, 0.0).to_csv_row()).unwrap();
+        }
+        let content = fs::read_to_string(dir.join("2026-09-28.csv")).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        // one header, then both rows
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], Sample::csv_header());
+        assert_eq!(csv_files(&dir), vec!["2026-09-28.csv"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn daily_log_never_mixes_two_formats() {
+        let dir = test_dir("log-format");
+        fs::write(dir.join("2026-09-28.csv"), "timestamp,temp_c\n1,60.0\n").unwrap();
+        drop(open_log_file(&dir, "2026-09-28", "14-05-00").unwrap());
+        assert_eq!(csv_files(&dir), vec!["2026-09-28.csv", "2026-09-28T14-05-00.csv"]);
+        let new = fs::read_to_string(dir.join("2026-09-28T14-05-00.csv")).unwrap();
+        assert_eq!(new.trim_end(), Sample::csv_header());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn prune_log_keeps_the_newest_days() {
+        let dir = test_dir("log-prune");
+        for name in [
+            "2026-09-25.csv",
+            "2026-09-26.csv",
+            "2026-09-27.csv",
+            "2026-09-27T14-05-00.csv",
+            "2026-09-28.csv",
+            "notes.txt",
+        ] {
+            fs::write(dir.join(name), "").unwrap();
+        }
+        prune_log(&dir, 2);
+        assert_eq!(
+            csv_files(&dir),
+            vec!["2026-09-27.csv", "2026-09-27T14-05-00.csv", "2026-09-28.csv", "notes.txt"]
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

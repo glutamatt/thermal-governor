@@ -45,15 +45,14 @@ impl LocalTime {
         format!("{:02}:{:02}:{:02}", self.hour, self.minute, self.second)
     }
 
+    /// `YYYY-MM-DD`
+    pub fn date(&self) -> String {
+        format!("{:04}-{:02}-{:02}", self.year, self.month, self.day)
+    }
+
     /// `YYYY-MM-DDTHH:MM:SS`
     pub fn iso(&self) -> String {
-        format!(
-            "{:04}-{:02}-{:02}T{}",
-            self.year,
-            self.month,
-            self.day,
-            self.time()
-        )
+        format!("{}T{}", self.date(), self.time())
     }
 }
 
@@ -72,6 +71,7 @@ mod tests {
             second: 7,
         };
         assert_eq!(t.time(), "08:03:07");
+        assert_eq!(t.date(), "2026-09-05");
         assert_eq!(t.iso(), "2026-09-05T08:03:07");
     }
 }

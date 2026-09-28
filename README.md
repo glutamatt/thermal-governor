@@ -85,6 +85,7 @@ The power chart also shows the package power averaged over the PL1 time window (
 - **Settings persistence**: when the platform profile, cap or EPP changes (from `hw-tui` or any tool writing the same sysfs files), it saves them to `/var/lib/thermal-governor/settings.json`. At startup, it restores them. With no saved file, it leaves the hardware as it is. The fan level is never saved: manual levels last one boot.
 - **Clean shutdown**: on stop, the fan goes back to the EC. Profile, cap and EPP are not touched, so a restart does not undo your tuning.
 - **Event log**: samples at 1 Hz into a 5-minute rolling buffer. On a notable event, it writes the buffer as a CSV to `/var/lib/thermal-governor/events/`. Only the newest 1000 files are kept.
+- **Continuous log**: every sample (1 Hz, same columns as the event CSVs) goes to `/var/lib/thermal-governor/log/<YYYY-MM-DD>.csv`, one file per local day, about 10 MB a day. It is the raw data for fitting and replaying a thermal model. After a restart, the daemon appends to the file of the day. If the columns changed (a daemon update), it starts `<YYYY-MM-DD>T<HH-MM-SS>.csv` instead: one file never mixes two formats. The newest 30 days are kept.
 - **Per-minute status** in the journal: SEN1 and SEN2 now; over the last minute, average RPM, % of time with the fan off, seconds of frequency drop, lowest PL1, highest SEN1.
 
 ### Events captured
@@ -118,9 +119,9 @@ timestamp,temp_c,temp_rate,cpu_load,fan1_rpm,fan2_rpm,fan_level,freq_min,freq_av
       │ platform_profile,    │ writes │  1 Hz loop                   │
       │ scaling_max_freq,    │ ─────► │  ├── fan curve → fan level   │
       │ /proc/acpi/ibm/fan,  │ reads  │  ├── save / restore settings │
-      │ energy_performance_  │        │  └── dump buffer to events/  │
-      │   preference         │        └──────────────────────────────┘
-      └──────────────────────┘
+      │ energy_performance_  │        │  ├── dump buffer to events/  │
+      │   preference         │        │  └── every sample to log/    │
+      └──────────────────────┘        └──────────────────────────────┘
 ```
 
 Both binaries share the hardware access code in `src/hw.rs` and the curve in `src/fan_curve.rs`.
@@ -138,6 +139,7 @@ sudo ./install.sh          # daemon: binary, systemd unit, fan_control=1 at boot
 State directory: `/var/lib/thermal-governor/`
 - `settings.json` — saved `platform_profile`, `freq_cap_mhz` and `epp`
 - `events/<timestamp>-<event>.csv` — buffer dump for each event
+- `log/<YYYY-MM-DD>.csv` — every sample, one file per day (30 days kept)
 
 `sudo ./uninstall.sh` removes the service and the modprobe option, and resets profile, cap, EPP and fan to their defaults. It keeps the state directory.
 
