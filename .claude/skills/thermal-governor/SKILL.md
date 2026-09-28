@@ -80,8 +80,15 @@ Tests: cap 2000, EPP `performance`, `stress-ng --cpu N`, fixed fan levels, 1 Hz 
   stopped, at ~62 °C package, even with the fan at level 0 (4 times on 2026-09-25). Under
   sustained load it did not come back: 9.5 min at 12 W and 400–800 MHz during a series of
   builds, with the fan curve down to level 1–2 because the capped power lowers its power
-  input. The SEN1 value at recovery (the hysteresis) is not known yet: the daemon does
-  not log SEN1.
+  input. The SEN1 value at recovery (the hysteresis) is not known yet. The daemon logs
+  SEN1 and SEN2 since 2026-09-28 (event CSVs and status line), so the next
+  `pl1-cut` event CSV will show it.
+- **The fan cools SEN1 about twice as fast at light load** (test of 2026-09-28,
+  `sen1-decay-20260928-120805.csv`, ~6 W of real use, after a morning of work): fan 0
+  gave 51 → 49 °C in 3 min (~0.7 °C/min), level 2 gave 49 → 43 °C in 5 min
+  (~1.2 °C/min, ~40 s of lag), `disengaged` 43 → 36 °C in 5 min. So a short run at a low
+  level is enough to get back the margin that a hot history eats. That is why the curve
+  starts the fan from SEN1 = 51 °C.
 - **Fan levels** (idle, laptop flat on the desk, fan1 / fan2 RPM): 0 → 0 / 0,
   1 → 3985 / 3480, 2 → 4839 / 4124, 3 → 5272 / 4765, 4 → 5790 / 5594, 5 → 6438 / 5924,
   6 → 6849 / 6338, 7 → 7537 / 7009, `disengaged` → ~9540 / 8900. Steps are regular
@@ -118,10 +125,48 @@ Tests: cap 2000, EPP `performance`, `stress-ng --cpu N`, fixed fan levels, 1 Hz 
 - **Test safety**: `echo "watchdog 10" > /proc/acpi/ibm/fan` makes the EC take the fan
   back if the controlling process stops sending `level` commands. Reset it to 0 after.
 
+## A power limit of our own: the MSR interface (tests of 2026-09-28)
+
+Tests: `rapl-msr-20260928-13*.csv` in `/var/lib/thermal-governor/tests/`, cap 4800,
+fan `disengaged`, `stress-ng`, 5 Hz logs. Script and safety stop (package 95 °C):
+`/tmp/claude-1000/phase0/rapl_msr_test.py` (not kept in the repo).
+
+- **The MSR limit register is not locked** (`0x610` bit 63 = 0). `intel-rapl:0`
+  `constraint_1` (PL2, window 2.4 ms) is writable, and the lower of the MSR and MMIO
+  limits applies.
+- **PL2 on the MSR holds to the tenth of a watt, and it throttles gracefully**:
+  16 workers at PL2 20 W → 20.0 W, 1690 MHz average, max frequency never under 1800,
+  72 °C; PL2 30 W → 30.0 W, 2360 MHz average, 88 °C. No drop to 400 MHz. The limit-reason
+  bit is 11 (0x800, PL2).
+- **Nobody overwrites it**: not the EC over ~4 min, not a profile change
+  (performance → balanced → performance moved the MMIO PL1 40 → 15 → 10 → 40 W; the MSR
+  values did not move).
+- **PL1 on the MSR (28 s average) is not tested yet**: 15 W with PL2 22 W gave 22 W for
+  63 s with no clamp, but the budget model of the power-limit section predicts the clamp
+  at ~60 s. The daemon does not need it: it can compute the average itself and drive PL2.
+- **The package temperature is a per-core hot spot.** One worker at ~4.5 GHz: package
+  power ~20 W, but the package sensor (the hottest core) jumps between 77 and 97 °C
+  within 0.2 s. Idle at cap 4800, a short burst of normal use reached 99 °C. A power
+  limit cannot prevent this: only the frequency cap bounds the heat of one core.
+- **A sustained single thread at cap 4800 does not collapse** (`hotspot-1t-20260928-134607.csv`,
+  2 × 60 s, fan `disengaged` from the curve): the package regulates at ~100 °C (max
+  103–105, never TjMax), the throttle counter runs 75–85 % of the time (limit-reason bit
+  1, thermal), and max frequency stays 4.3–4.5 GHz (median 4440, never under 4089): about
+  −8 % against 4800. The user finds this loss harmless (2026-09-28), so the cap can stay
+  at max. The cost is heat: ~21 W package for one thread, and SEN1 rose 48 → 50 °C in
+  2 min even at full fan.
+- **Sustained all-core limit, fan at full speed**: ~30 W gives 85–99 °C within 25 s; 22 W
+  stays under 80 °C for 60 s; 23 W held 70–73 °C for 8 min (2026-09-25).
+- `MSR 0x1A2`: TjMax 110 °C, TCC offset 5 °C (target 105 °C). The throttle counter still
+  moves from ~98 °C (13:13 event on 2026-09-28: 7 → 43 W and 61 → 93 °C in one second at
+  cap 4800, throttle 152 ms/s, max frequency stayed 4.2–4.6 GHz).
+
 ## Working on this
 
 - **The daemon runs one control loop: the fan curve** (`src/fan_curve.rs`), asked for on
-  2026-09-25. Goal: zero max-frequency drops with the least fan RPM. It never touches the
+  2026-09-25. Goal: zero max-frequency drops with the least fan RPM. Since 2026-09-28
+  SEN1 is one of its inputs (full speed at 53 °C, one degree under the cut), and a PL1
+  cut keeps its power input from falling (GitHub issue #3). It never touches the
   cap, EPP or profile on its own: those stay manual (`hw-tui`), the daemon only saves and
   restores them. The learned auto-tuner is abandoned; don't bring it back unasked.
 - **Fan modes** (`/run/thermal-governor/fan-mode`, so every boot starts on `curve`):
