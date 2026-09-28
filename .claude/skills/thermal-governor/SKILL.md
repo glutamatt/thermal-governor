@@ -128,8 +128,7 @@ Tests: cap 2000, EPP `performance`, `stress-ng --cpu N`, fixed fan levels, 1 Hz 
 ## A power limit of our own: the MSR interface (tests of 2026-09-28)
 
 Tests: `rapl-msr-20260928-13*.csv` in `/var/lib/thermal-governor/tests/`, cap 4800,
-fan `disengaged`, `stress-ng`, 5 Hz logs. Script and safety stop (package 95 °C):
-`/tmp/claude-1000/phase0/rapl_msr_test.py` (not kept in the repo).
+fan `disengaged`, `stress-ng`, 5 Hz logs. Scripts: `/var/lib/thermal-governor/tests/scripts/` (not in the repo).
 
 - **The MSR limit register is not locked** (`0x610` bit 63 = 0). `intel-rapl:0`
   `constraint_1` (PL2, window 2.4 ms) is writable, and the lower of the MSR and MMIO
@@ -160,6 +159,47 @@ fan `disengaged`, `stress-ng`, 5 Hz logs. Script and safety stop (package 95 °C
 - `MSR 0x1A2`: TjMax 110 °C, TCC offset 5 °C (target 105 °C). The throttle counter still
   moves from ~98 °C (13:13 event on 2026-09-28: 7 → 43 W and 61 → 93 °C in one second at
   cap 4800, throttle 152 ms/s, max frequency stayed 4.2–4.6 GHz).
+
+## Throughput per watt, and the SEN1 model (tests of 2026-09-28)
+
+**Throughput under a PL2 limit** (`pl2-sweep-20260928-*.csv`: `stress-ng --cpu-method
+matrixprod`, cap 4800, fan on the curve, bogo ops/s):
+
+| Threads | 10 W | 14 W | 18 W | 22 W | 26 W | 30 W | no limit |
+|---|---|---|---|---|---|---|---|
+| 1 | 1193 | 2390 | 2719 | **2950** | 2953 | 2718 | 2710 (20 W) |
+| 2 | 2493 | 4017 | 4813 | 5297 | **5542** | 5422 | 5310 (31 W) |
+| 4 | 2250 | 5267 | 7086 | 8352 | 9210 | 9696 | 9800 (41 W) |
+| 8 | 2837 | 7079 | 9653 | 12026 | 13103 | 14632 | – |
+| 16 | 3214 | 6806 | 10335 | 12689 | 15768 | 18107 | – |
+
+- **When the thermal throttle dominates, throughput falls**: 1 thread gives 9 % more at
+  22 W than with no limit, 2 threads 4 % more at 26 W. So a dominant throttle (limit-reason
+  bit 1) means the power budget is above its optimum: a threshold-free signal.
+- More threads give much more per watt (2 threads at 14 W beat 1 thread at 22 W). 16
+  threads stay near-proportional up to 30 W. Below ~10 W almost nothing reaches the cores
+  (~6–8 W go to the rest of the chip and normal use); 16 threads at 10 W sit at 400 MHz.
+
+**SEN1 model** (`fit_sen1.py`, fitted on `thermal-steps-20260928-141113.csv` plus the
+2026-09-25 tests and `sen1-decay`): first order per fan level,
+`dS/dt = (S_amb + G·P − S) / τ`, P = package power.
+
+| Fan | G (°C/W) | τ (s) | Package R (°C/W) | Sustainable P, ambient 26 / 30 °C |
+|---|---|---|---|---|
+| 0 | 2.59 | 333 | 2.08 | 10.2 / 8.7 W |
+| 2 | 1.65 | 256 | 1.73 | 16.0 / 13.6 W |
+| 4 | 1.42 | 240 | 1.54 | 18.7 / 15.9 W |
+| 7 | 1.20 | 253 | – | 22.1 / 18.8 W |
+| `disengaged` | 1.04 | 190 | 1.35 | 25.5 / 21.7 W |
+
+- "Sustainable" = SEN1 at equilibrium ≤ 52.5 °C (the 54 °C cut minus the 1.5 °C largest
+  fit error). Level 1 is poorly identified (one 110 s segment): not in the table.
+- Fit error: 0.3–0.8 °C RMS per segment, 1.7 °C at most. SEN1 reads whole degrees.
+- **S_amb is not constant**: 25.9 °C fitted for 2026-09-25, 30.0 °C for 2026-09-28. No
+  sensor gives it directly: a controller has to estimate it online.
+- At idle (~7 W) with the fan off, SEN1 settles near 48 °C (ambient 30): only ~6 °C
+  under the cut. A 25 W burst at fan 0 then gains ~0.14 °C/s, so the cut comes in ~45 s
+  unless the fan starts. That matches the cuts seen after builds.
 
 ## Working on this
 
