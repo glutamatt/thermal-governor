@@ -55,6 +55,8 @@ The mode lives in `/run/thermal-governor/fan-mode`, so **every boot starts on th
 
 A terminal UI with six live charts (temperature, fan RPM, power, throttle, CPU usage, frequency min/avg/max with the cap as a dotted line).
 
+The power chart also shows the package power averaged over the PL1 time window (tau, 28 s here), and PL1 itself as a dotted line. Both come from `intel-rapl-mmio:0`. PL1 limits this average, not the power itself. When the average reaches the line, its value turns red: max frequency will drop to ~400 MHz soon. The firmware clamps later than this average predicts (up to ~35 s later in the tests), so read it as an early warning.
+
 | Key   | Action |
 |-------|--------|
 | `c`   | Fan: curve (the daemon drives it) |

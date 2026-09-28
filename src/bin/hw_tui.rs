@@ -33,6 +33,8 @@ const FAN_LEVELS: &[&str] = &["0", "1", "2", "3", "4", "5", "6", "7", "disengage
 
 const HISTORY_CAP: usize = 300; // 5 minutes at 1Hz
 const SAMPLE_PERIOD: Duration = Duration::from_secs(1);
+// Spacing of the dots of a dotted line, in s of x range
+const DOTTED_STEP_S: f64 = 3.0;
 
 const STRESS_LEVELS: &[u32] = &[0, 1, 2, 4, 8, 16];
 // Cap steps go from FREQ_CAP_MIN up to the highest core frequency (= no cap)
@@ -64,6 +66,25 @@ impl TimeSeries {
 
     fn as_vec(&self) -> Vec<(f64, f64)> {
         self.data.iter().copied().collect()
+    }
+
+    /// Time of the newest point
+    fn last_x(&self) -> Option<f64> {
+        self.data.back().map(|&(x, _)| x)
+    }
+
+    /// The first point of each DOTTED_STEP_S slot of time: a dotted line.
+    /// Slots are fixed in time, so the dots scroll with the data.
+    fn dotted(&self) -> Vec<(f64, f64)> {
+        let mut slot = None;
+        self.data
+            .iter()
+            .copied()
+            .filter(|&(x, _)| {
+                let s = Some((x / DOTTED_STEP_S).floor() as i64);
+                std::mem::replace(&mut slot, s) != s
+            })
+            .collect()
     }
 
     fn y_bounds(&self, default_min: f64, default_max: f64, padding: f64) -> [f64; 2] {
@@ -142,6 +163,8 @@ struct App {
     throttle_rate: TimeSeries,
     cpu_usage: TimeSeries,
     power: TimeSeries,
+    power_avg: TimeSeries,
+    pl1: TimeSeries,
     sys_power: TimeSeries,
     rest_power: TimeSeries,
     freq_min: TimeSeries,
@@ -187,6 +210,11 @@ struct App {
     cur_throttle_rate: f64,
     cur_cpu: f64,
     cur_power_w: f64,
+    // Package power averaged over the PL1 window: PL1 limits this average,
+    // not the power itself
+    cur_power_avg_w: Option<f64>,
+    cur_pl1_w: Option<f64>,
+    cur_pl1_window_s: Option<f64>,
     cur_sys_power_w: Option<f64>,
     cur_freq_min: u32,
     cur_freq_avg: u32,
@@ -225,6 +253,8 @@ impl App {
             throttle_rate: TimeSeries::new(),
             cpu_usage: TimeSeries::new(),
             power: TimeSeries::new(),
+            power_avg: TimeSeries::new(),
+            pl1: TimeSeries::new(),
             sys_power: TimeSeries::new(),
             rest_power: TimeSeries::new(),
             freq_min: TimeSeries::new(),
@@ -266,6 +296,9 @@ impl App {
             cur_throttle_rate: 0.0,
             cur_cpu: 0.0,
             cur_power_w: 0.0,
+            cur_power_avg_w: None,
+            cur_pl1_w: None,
+            cur_pl1_window_s: None,
             cur_sys_power_w: None,
             cur_freq_min: 0,
             cur_freq_avg: 0,
@@ -319,10 +352,24 @@ impl App {
         self.cpu_usage.push(elapsed, usage);
         self.cur_cpu = usage;
 
-        // Power (RAPL)
+        // PL1 and its window: the EC lowers PL1 when the machine is hot
+        self.cur_pl1_w = hw::read_pl1_w();
+        if let Some(pl1) = self.cur_pl1_w {
+            self.pl1.push(elapsed, pl1);
+        }
+        self.cur_pl1_window_s = hw::read_pl1_window_s();
+
+        // Power (RAPL), and its average over the PL1 window. The firmware
+        // does not clamp the moment this average reaches PL1 (tests of
+        // 2026-09-25: up to ~35 s later), so this is an early warning.
         if let Some(watts) = self.rapl_meter.sample() {
+            let dt = self.power.last_x().map_or(0.0, |t| elapsed - t);
             self.power.push(elapsed, watts);
             self.cur_power_w = watts;
+            if let Some(tau) = self.cur_pl1_window_s {
+                let avg = fan_curve::smooth(&mut self.cur_power_avg_w, watts, dt, tau);
+                self.power_avg.push(elapsed, avg);
+            }
         }
 
         // System power (battery)
@@ -816,13 +863,13 @@ fn y_axis<'a>(y_bounds: [f64; 2]) -> Axis<'a> {
         .style(Style::default().fg(Color::DarkGray))
 }
 
-/// Dotted horizontal line: one scatter point every 3s of x range
+/// Dotted horizontal line: one scatter point every DOTTED_STEP_S of x range
 fn ref_line_points(x_bounds: [f64; 2], y: f64) -> Vec<(f64, f64)> {
     let mut pts = Vec::new();
     let mut x = x_bounds[0];
     while x <= x_bounds[1] {
         pts.push((x, y));
-        x += 3.0;
+        x += DOTTED_STEP_S;
     }
     pts
 }
@@ -877,24 +924,35 @@ fn draw_chart(frame: &mut Frame, area: Rect, spec: ChartSpec) {
 
 fn draw_power_chart(frame: &mut Frame, area: Rect, app: &App) {
     let data_rapl = app.power.as_vec();
+    let data_avg = app.power_avg.as_vec();
     let data_sys = app.sys_power.as_vec();
     let data_rest = app.rest_power.as_vec();
+    // PL1 as it was over time, dotted: it moves with the profile and the EC.
+    // Above the y range, it is not drawn.
+    let data_pl1 = app.pl1.dotted();
 
     let on_battery = app.cur_sys_power_w.is_some();
 
     // Y bounds: use sys_power if on battery, otherwise just RAPL
     let y_lo = 0.0;
-    let y_hi = if on_battery {
-        app.sys_power
-            .y_bounds(0.0, 80.0, 3.0)[1]
-            .max(app.power.y_bounds(0.0, 80.0, 3.0)[1])
-    } else {
-        app.power.y_bounds(0.0, 80.0, 3.0)[1]
-    };
+    let mut y_hi = app
+        .power
+        .y_bounds(0.0, 80.0, 3.0)[1]
+        .max(app.power_avg.y_bounds(0.0, 80.0, 3.0)[1]);
+    if on_battery {
+        y_hi = y_hi.max(app.sys_power.y_bounds(0.0, 80.0, 3.0)[1]);
+    }
     let y_bounds = [y_lo, y_hi.max(1.0)];
     let x_bounds = app.power.x_bounds();
 
-    let mut datasets = Vec::new();
+    // Reference line first so the curves draw on top
+    let mut datasets = vec![
+        Dataset::default()
+            .data(&data_pl1)
+            .graph_type(GraphType::Scatter)
+            .marker(symbols::Marker::Dot)
+            .style(Style::default().fg(Color::White)),
+    ];
 
     if on_battery {
         datasets.push(
@@ -920,6 +978,13 @@ fn draw_power_chart(frame: &mut Frame, area: Rect, app: &App) {
             .marker(symbols::Marker::Braille)
             .style(Style::default().fg(Color::Magenta)),
     );
+    datasets.push(
+        Dataset::default()
+            .data(&data_avg)
+            .graph_type(GraphType::Line)
+            .marker(symbols::Marker::Braille)
+            .style(Style::default().fg(Color::Yellow)),
+    );
 
     // Title with current values
     let mut title_spans = vec![
@@ -927,6 +992,19 @@ fn draw_power_chart(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled("cpu:", Style::default().fg(Color::DarkGray)),
         Span::styled(format!("{:.1}W", app.cur_power_w), Style::default().fg(Color::Magenta)),
     ];
+    if let (Some(avg), Some(tau)) = (app.cur_power_avg_w, app.cur_pl1_window_s) {
+        // Red once the average reaches PL1: a clamp to ~400 MHz is coming
+        let at_limit = app.cur_pl1_w.is_some_and(|pl1| avg >= pl1);
+        title_spans.push(Span::styled(format!(" avg{tau:.0}s:"), Style::default().fg(Color::DarkGray)));
+        title_spans.push(Span::styled(
+            format!("{avg:.1}W"),
+            Style::default().fg(if at_limit { Color::Red } else { Color::Yellow }),
+        ));
+    }
+    if let Some(pl1) = app.cur_pl1_w {
+        title_spans.push(Span::styled(" PL1:", Style::default().fg(Color::DarkGray)));
+        title_spans.push(Span::styled(format!("{pl1:.0}W"), Style::default().fg(Color::White)));
+    }
     if let Some(sys_w) = app.cur_sys_power_w {
         let rest = (sys_w - app.cur_power_w).max(0.0);
         title_spans.push(Span::styled(" rest:", Style::default().fg(Color::DarkGray)));
@@ -1318,6 +1396,18 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dotted_keeps_one_point_per_slot() {
+        let mut series = TimeSeries::new();
+        for (x, y) in [(0.2, 40.0), (1.2, 40.0), (2.9, 40.0), (3.1, 12.0), (5.0, 12.0), (6.4, 12.0)] {
+            series.push(x, y);
+        }
+        assert_eq!(series.dotted(), vec![(0.2, 40.0), (3.1, 12.0), (6.4, 12.0)]);
+        // The oldest point scrolls out: the other dots do not move
+        series.data.pop_front();
+        assert_eq!(series.dotted(), vec![(1.2, 40.0), (3.1, 12.0), (6.4, 12.0)]);
+    }
 
     #[test]
     fn cap_steps_end_at_the_highest_core_frequency() {

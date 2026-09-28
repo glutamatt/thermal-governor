@@ -216,7 +216,7 @@ pub fn nearest_level(rpm: f64) -> &'static str {
 
 /// Exponential moving average with time constant `tau`, started on the first
 /// value. Returns the new average.
-fn smooth(avg: &mut Option<f64>, x: f64, dt: f64, tau: f64) -> f64 {
+pub fn smooth(avg: &mut Option<f64>, x: f64, dt: f64, tau: f64) -> f64 {
     let a = avg.get_or_insert(x);
     *a += (1.0 - (-dt / tau).exp()) * (x - *a);
     *a

@@ -23,6 +23,8 @@ const RAPL_ENERGY_PATH: &str = "/sys/class/powercap/intel-rapl:0/energy_uj";
 const RAPL_MAX_ENERGY_PATH: &str = "/sys/class/powercap/intel-rapl:0/max_energy_range_uj";
 // The MSR interface (intel-rapl:0) shows 64 W; the firmware's lower PL1 lives here
 const RAPL_MMIO_PL1_PATH: &str = "/sys/class/powercap/intel-rapl-mmio:0/constraint_0_power_limit_uw";
+const RAPL_MMIO_PL1_WINDOW_PATH: &str =
+    "/sys/class/powercap/intel-rapl-mmio:0/constraint_0_time_window_us";
 const PLATFORM_PROFILE_PATH: &str = "/sys/firmware/acpi/platform_profile";
 const PLATFORM_PROFILE_CHOICES_PATH: &str = "/sys/firmware/acpi/platform_profile_choices";
 const BATTERY_STATUS_PATH: &str = "/sys/class/power_supply/BAT0/status";
@@ -296,6 +298,14 @@ pub fn platform_profile_choices() -> Vec<String> {
 /// when the machine is hot, even in the performance profile.
 pub fn read_pl1_w() -> Option<f64> {
     read_i64(RAPL_MMIO_PL1_PATH).map(|uw| uw as f64 / 1_000_000.0)
+}
+
+/// PL1 time window (tau), in s: PL1 limits the package power averaged over
+/// this window (28 s here)
+pub fn read_pl1_window_s() -> Option<f64> {
+    read_i64(RAPL_MMIO_PL1_WINDOW_PATH)
+        .filter(|&us| us > 0)
+        .map(|us| us as f64 / 1_000_000.0)
 }
 
 // =============================================================================
