@@ -159,6 +159,7 @@ fn prev_cap(steps: &[u32], cur: Option<u32>) -> Option<u32> {
 
 struct App {
     temp: TimeSeries,
+    sen1: TimeSeries,
     fan: TimeSeries,
     throttle_rate: TimeSeries,
     cpu_usage: TimeSeries,
@@ -191,6 +192,7 @@ struct App {
     cpufreq_dirs: Vec<PathBuf>,
     fans: FanSensor,
     temp_sensor: PathBuf,
+    sen_sensors: Vec<hw::SenSensor>,
 
     events: VecDeque<(String, String)>, // (timestamp, message)
     start: Instant,
@@ -198,6 +200,7 @@ struct App {
     should_quit: bool,
 
     cur_temp: f64,
+    cur_sen1: Option<f64>,
     cur_fan: u32,
     cur_fan1: u32,
     cur_fan2: u32,
@@ -249,6 +252,7 @@ impl App {
 
         Self {
             temp: TimeSeries::new(),
+            sen1: TimeSeries::new(),
             fan: TimeSeries::new(),
             throttle_rate: TimeSeries::new(),
             cpu_usage: TimeSeries::new(),
@@ -280,6 +284,7 @@ impl App {
             cpufreq_dirs: dirs,
             fans: FanSensor::discover(),
             temp_sensor,
+            sen_sensors: hw::find_sen_sensors(),
 
             events: VecDeque::with_capacity(10),
             start: now,
@@ -287,6 +292,7 @@ impl App {
             should_quit: false,
 
             cur_temp: 0.0,
+            cur_sen1: None,
             cur_fan: 0,
             cur_fan1: 0,
             cur_fan2: 0,
@@ -332,6 +338,11 @@ impl App {
         if let Some(temp) = hw::cpu_temp(&self.temp_sensor) {
             self.temp.push(elapsed, temp);
             self.cur_temp = temp;
+        }
+        // SEN1: the board sensor the EC watches for the PL1 cut
+        self.cur_sen1 = hw::sen_temp(&self.sen_sensors, "SEN1");
+        if let Some(sen1) = self.cur_sen1 {
+            self.sen1.push(elapsed, sen1);
         }
 
         // Fan
@@ -725,31 +736,7 @@ fn draw_charts(frame: &mut Frame, area: Rect, app: &App) {
         ])
         .split(rows[1]);
 
-    let temp_emoji = if app.cur_temp >= 85.0 {
-        "🔥"
-    } else if app.cur_temp >= 70.0 {
-        "🌡️"
-    } else {
-        "❄️"
-    };
-    draw_chart(
-        frame,
-        top[0],
-        ChartSpec {
-            title: format!(" {temp_emoji} Temp  {:.0}°C ", app.cur_temp),
-            series: &app.temp,
-            color: Color::Yellow,
-            border_color: if app.cur_temp >= 85.0 {
-                Color::Red
-            } else {
-                Color::Yellow
-            },
-            y_min: 30.0,
-            y_max: 110.0,
-            y_pad: 5.0,
-            ref_lines: &[(85.0, Color::LightRed), (95.0, Color::Red)],
-        },
-    );
+    draw_temp_chart(frame, top[0], app);
 
     let fan_emoji = if app.cur_fan >= 4000 {
         "🌪️"
@@ -915,6 +902,103 @@ fn draw_chart(frame: &mut Frame, area: Rect, spec: ChartSpec) {
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(spec.border_color)),
+        )
+        .x_axis(x_axis(x_bounds))
+        .y_axis(y_axis(y_bounds));
+
+    frame.render_widget(chart, area);
+}
+
+/// Package temperature, and SEN1 with its PL1 cut threshold dotted
+fn draw_temp_chart(frame: &mut Frame, area: Rect, app: &App) {
+    let data_temp = app.temp.as_vec();
+    let data_sen1 = app.sen1.as_vec();
+
+    let [temp_lo, temp_hi] = app.temp.y_bounds(30.0, 110.0, 5.0);
+    let y_bounds = if app.sen1.data.is_empty() {
+        [temp_lo, temp_hi]
+    } else {
+        let [lo, hi] = app.sen1.y_bounds(30.0, 110.0, 5.0);
+        [temp_lo.min(lo), temp_hi.max(hi)]
+    };
+    let x_bounds = app.temp.x_bounds();
+
+    // Reference lines first so the curves draw on top
+    let ref_lines = [
+        (hw::SEN1_PL1_CUT_C, Color::Cyan),
+        (85.0, Color::LightRed),
+        (95.0, Color::Red),
+    ];
+    let ref_data: Vec<(Vec<(f64, f64)>, Color)> = ref_lines
+        .iter()
+        .filter(|(v, _)| *v >= y_bounds[0] && *v <= y_bounds[1])
+        .map(|&(v, c)| (ref_line_points(x_bounds, v), c))
+        .collect();
+    let mut datasets: Vec<Dataset> = ref_data
+        .iter()
+        .map(|(pts, c)| {
+            Dataset::default()
+                .data(pts)
+                .graph_type(GraphType::Scatter)
+                .marker(symbols::Marker::Dot)
+                .style(Style::default().fg(*c))
+        })
+        .collect();
+    datasets.push(
+        Dataset::default()
+            .data(&data_sen1)
+            .graph_type(GraphType::Line)
+            .marker(symbols::Marker::Braille)
+            .style(Style::default().fg(Color::Cyan)),
+    );
+    datasets.push(
+        Dataset::default()
+            .data(&data_temp)
+            .graph_type(GraphType::Line)
+            .marker(symbols::Marker::Braille)
+            .style(Style::default().fg(Color::Yellow)),
+    );
+
+    let temp_emoji = if app.cur_temp >= 85.0 {
+        "🔥"
+    } else if app.cur_temp >= 70.0 {
+        "🌡️"
+    } else {
+        "❄️"
+    };
+    let mut title_spans = vec![
+        Span::styled(
+            format!(" {temp_emoji} Temp  {:.0}°C ", app.cur_temp),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(sen1) = app.cur_sen1 {
+        // Red one degree under the cut: the fan curve is at full speed there
+        let near_cut = sen1 >= hw::SEN1_PL1_CUT_C - 1.0;
+        title_spans.push(Span::styled("SEN1:", Style::default().fg(Color::DarkGray)));
+        title_spans.push(Span::styled(
+            format!("{sen1:.0}°C"),
+            Style::default()
+                .fg(if near_cut { Color::Red } else { Color::Cyan })
+                .add_modifier(Modifier::BOLD),
+        ));
+        title_spans.push(Span::styled(
+            format!(" (cut {:.0}) ", hw::SEN1_PL1_CUT_C),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    let chart = Chart::new(datasets)
+        .block(
+            Block::default()
+                .title(Line::from(title_spans))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(if app.cur_temp >= 85.0 {
+                    Color::Red
+                } else {
+                    Color::Yellow
+                })),
         )
         .x_axis(x_axis(x_bounds))
         .y_axis(y_axis(y_bounds));

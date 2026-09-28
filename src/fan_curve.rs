@@ -1,15 +1,18 @@
 //! Fan curve: the least fan that keeps max frequency from dropping.
 //!
-//! The drops to avoid are PL1 cuts by the EC, never seen below 75 °C package
-//! (see the "Power limits" section of the thermal-governor SKILL.md). Two
-//! linear demands, 0.0–1.0, from package power (early: heat is coming) and
-//! from package temperature (the correction), each on a smoothed input. The
-//! higher one wins and maps to the nearest of the 9 fan levels. The demand
-//! follows the inputs both ways: the fan stops soon after the load ends.
+//! The drops to avoid are PL1 cuts by the EC, which come when the board
+//! sensor SEN1 reaches 54 °C (see the "Power limits" section of the
+//! thermal-governor SKILL.md). Three linear demands, 0.0–1.0: from package
+//! power (early: heat is coming), from package temperature (the fast
+//! correction), each on a smoothed input, and from SEN1 (the sensor the EC
+//! watches). The highest one wins and maps to the nearest of the 9 fan
+//! levels. The power and temperature demands follow their inputs both ways:
+//! the fan stops soon after a short load. The SEN1 demand falls slowly.
 //!
 //! The daemon runs it; hw-tui switches the mode and shows the state through
 //! two small files in /run.
 
+use crate::hw;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
@@ -21,7 +24,9 @@ use std::io;
 /// Fan off holds up to ~9 W; ~23 W needs full speed
 const POWER_ZERO_W: f64 = 9.0;
 const POWER_FULL_W: f64 = 23.0;
-/// Below 62 °C no demand; full speed at 74 °C, under the 75 °C no-cut limit
+/// Below 62 °C no demand; full speed at 74 °C. The package does not predict
+/// the PL1 cut (seen from 68 °C to 88 °C): SEN1 does, this is the fast
+/// correction.
 const TEMP_ZERO_C: f64 = 62.0;
 const TEMP_FULL_C: f64 = 74.0;
 /// Power smoothing: long enough to ignore short spikes, short enough to act
@@ -34,13 +39,21 @@ const POWER_TAU_S: f64 = 10.0;
 /// above 72 °C the smoothed demand is the raw one (the power demand covers a
 /// fast heat-up).
 const TEMP_TAU_S: f64 = 8.0;
+/// SEN1 demand: none below SEN1_ZERO_C, full speed at SEN1_FULL_C, one
+/// degree under the 54 °C cut. SEN1 reads in whole degrees and moves ~1 °C
+/// per 15–60 s under load, so it needs no smoothing.
+const SEN1_ZERO_C: f64 = 50.0;
+const SEN1_FULL_C: f64 = hw::SEN1_PL1_CUT_C - 1.0;
+/// SEN1 cools slowly: the demand it set falls with this time constant, so a
+/// sensor between two whole degrees does not move the fan up and down
+const SEN1_FALL_TAU_S: f64 = 60.0;
 /// After a hard limit, full demand falls with this time constant
 const GUARD_FALL_TAU_S: f64 = 30.0;
 /// Margin around the midpoint between two levels, against flapping
 const HYSTERESIS_RPM: f64 = 150.0;
 
-/// Hard limits, whatever the mode: full speed at once. The EC cuts PL1 from
-/// ~77 °C, and the kernel powers off when a SEN sensor reaches 80 °C.
+/// Hard limits, whatever the mode: full speed at once. The kernel powers off
+/// when a SEN sensor reaches 80 °C.
 const GUARD_PKG_C: f64 = 80.0;
 const GUARD_SEN_C: f64 = 70.0;
 
@@ -121,6 +134,9 @@ pub struct Status {
     pub need: f64,
     pub need_power: f64,
     pub need_temp: f64,
+    /// Missing in a status written by an older daemon
+    #[serde(default)]
+    pub need_sen1: f64,
     /// Why a hard limit forced full speed
     pub guard: Option<String>,
 }
@@ -144,16 +160,29 @@ impl Status {
 // Curve
 // =============================================================================
 
+/// What the curve reads on one tick
+pub struct Inputs {
+    pub temp_c: f64,
+    /// Package power; None when RAPL is unreadable
+    pub power_w: Option<f64>,
+    /// None when the sensor is missing or unreadable
+    pub sen1_c: Option<f64>,
+    /// The EC has lowered PL1 below what the profile set
+    pub pl1_cut: bool,
+}
+
 pub struct Decision {
     pub level: &'static str,
     pub need: f64,
     pub need_power: f64,
     pub need_temp: f64,
+    pub need_sen1: f64,
 }
 
 pub struct Curve {
     power_avg: Option<f64>,
     temp_avg: Option<f64>,
+    sen1_need: f64,
     /// Demand left by a tripped hard limit, falling to 0
     guard_need: f64,
     level: usize,
@@ -170,22 +199,35 @@ impl Curve {
         Self {
             power_avg: None,
             temp_avg: None,
+            sen1_need: 0.0,
             guard_need: 0.0,
             level: 0,
         }
     }
 
-    /// One step. `dt`: seconds since the last call. `power_w`: package power,
-    /// None when RAPL is unreadable (the temperature demand alone then).
-    pub fn update(&mut self, dt: f64, temp_c: f64, power_w: Option<f64>) -> Decision {
-        if let Some(p) = power_w {
-            smooth(&mut self.power_avg, p, dt, POWER_TAU_S);
+    /// One step. `dt`: seconds since the last call.
+    pub fn update(&mut self, dt: f64, inputs: &Inputs) -> Decision {
+        if let Some(p) = inputs.power_w {
+            let before = self.power_avg;
+            let avg = smooth(&mut self.power_avg, p, dt, POWER_TAU_S);
+            // During a cut, PL1 caps the power: its fall does not mean the
+            // machine is cooler. Lowering the fan then would keep SEN1 hot,
+            // and the cut going.
+            if inputs.pl1_cut {
+                self.power_avg = before.map(|b| b.max(avg)).or(Some(avg));
+            }
         }
-        let temp_avg = smooth(&mut self.temp_avg, temp_c, dt, TEMP_TAU_S);
+        let temp_avg = smooth(&mut self.temp_avg, inputs.temp_c, dt, TEMP_TAU_S);
         let need_power = self.power_avg.map_or(0.0, |p| ramp(p, POWER_ZERO_W, POWER_FULL_W));
         let need_temp = ramp(temp_avg, TEMP_ZERO_C, TEMP_FULL_C);
+        // Up at once, down slowly
+        let sen1_now = inputs.sen1_c.map_or(0.0, |t| ramp(t, SEN1_ZERO_C, SEN1_FULL_C));
+        self.sen1_need = sen1_now.max(self.sen1_need * (-dt / SEN1_FALL_TAU_S).exp());
         self.guard_need *= (-dt / GUARD_FALL_TAU_S).exp();
-        let need = need_power.max(need_temp).max(self.guard_need);
+        let need = need_power
+            .max(need_temp)
+            .max(self.sen1_need)
+            .max(self.guard_need);
 
         self.level = pick_level(self.level, need * LEVELS[LEVELS.len() - 1].1);
         Decision {
@@ -193,6 +235,7 @@ impl Curve {
             need,
             need_power,
             need_temp,
+            need_sen1: self.sen1_need,
         }
     }
 }
@@ -257,11 +300,21 @@ pub fn guard(temp_c: Option<f64>, sen_max_c: Option<f64>) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Package temperature and power, with SEN1 cool and PL1 not cut
+    fn cool(temp_c: f64, power_w: Option<f64>) -> Inputs {
+        Inputs {
+            temp_c,
+            power_w,
+            sen1_c: Some(45.0),
+            pl1_cut: false,
+        }
+    }
+
     #[test]
     fn idle_machine_keeps_the_fan_off() {
         let mut c = Curve::new();
         for _ in 0..120 {
-            let d = c.update(1.0, 55.0, Some(6.0));
+            let d = c.update(1.0, &cool(55.0, Some(6.0)));
             assert_eq!(d.level, "0");
         }
     }
@@ -269,11 +322,11 @@ mod tests {
     #[test]
     fn full_load_goes_to_full_speed_before_the_heat_arrives() {
         let mut c = Curve::new();
-        c.update(1.0, 60.0, Some(6.0));
+        c.update(1.0, &cool(60.0, Some(6.0)));
         // 25 W while the package is still cool: the power demand acts first
         let mut level = "0";
         for s in 1..=30 {
-            level = c.update(1.0, 60.0, Some(25.0)).level;
+            level = c.update(1.0, &cool(60.0, Some(25.0))).level;
             if level == FULL_SPEED {
                 assert!(s <= 20, "full speed only after {s} s");
                 break;
@@ -285,10 +338,10 @@ mod tests {
     #[test]
     fn temperature_alone_reaches_full_speed_at_74() {
         let mut c = Curve::new();
-        c.update(1.0, 60.0, None);
+        c.update(1.0, &cool(60.0, None));
         let mut level = "0";
         for s in 1..=30 {
-            level = c.update(1.0, 74.0, None).level;
+            level = c.update(1.0, &cool(74.0, None)).level;
             if level == FULL_SPEED {
                 assert!(s <= 25, "full speed only after {s} s");
                 break;
@@ -303,26 +356,26 @@ mod tests {
     fn a_short_temperature_spike_does_not_start_the_fan() {
         let mut c = Curve::new();
         for _ in 0..30 {
-            c.update(1.0, 60.0, Some(6.0));
+            c.update(1.0, &cool(60.0, Some(6.0)));
         }
         for _ in 0..3 {
-            assert_eq!(c.update(1.0, 70.0, Some(6.0)).level, "0");
+            assert_eq!(c.update(1.0, &cool(70.0, Some(6.0))).level, "0");
         }
-        assert_eq!(c.update(1.0, 61.0, Some(6.0)).level, "0");
+        assert_eq!(c.update(1.0, &cool(61.0, Some(6.0))).level, "0");
     }
 
     #[test]
     fn the_fan_stops_soon_after_the_load_ends() {
         let mut c = Curve::new();
         for _ in 0..120 {
-            c.update(1.0, 73.0, Some(24.0));
+            c.update(1.0, &cool(73.0, Some(24.0)));
         }
-        assert_eq!(c.update(1.0, 73.0, Some(24.0)).level, FULL_SPEED);
+        assert_eq!(c.update(1.0, &cool(73.0, Some(24.0))).level, FULL_SPEED);
         // The package cools fast once the load is gone
         let mut stopped = None;
         for s in 1..=60 {
             let temp = (73.0 - s as f64).max(58.0);
-            if c.update(1.0, temp, Some(7.0)).level == "0" {
+            if c.update(1.0, &cool(temp, Some(7.0))).level == "0" {
                 stopped = Some(s);
                 break;
             }
@@ -343,15 +396,68 @@ mod tests {
     #[test]
     fn a_tripped_guard_falls_slowly() {
         let mut c = Curve::new();
-        c.update(1.0, 50.0, Some(6.0));
+        c.update(1.0, &cool(50.0, Some(6.0)));
         c.force_full();
         // guard cleared, machine cool: still high a few seconds later
-        let d = c.update(1.0, 50.0, Some(6.0));
+        let d = c.update(1.0, &cool(50.0, Some(6.0)));
         assert_eq!(d.level, FULL_SPEED);
         for _ in 0..10 {
-            c.update(1.0, 50.0, Some(6.0));
+            c.update(1.0, &cool(50.0, Some(6.0)));
         }
-        assert!(c.update(1.0, 50.0, Some(6.0)).need > 0.6);
+        assert!(c.update(1.0, &cool(50.0, Some(6.0))).need > 0.6);
+    }
+
+    #[test]
+    fn a_hot_sen1_starts_the_fan_on_a_cool_package() {
+        let mut c = Curve::new();
+        let at = |sen1| Inputs {
+            sen1_c: Some(sen1),
+            ..cool(55.0, Some(6.0))
+        };
+        assert_eq!(c.update(1.0, &at(SEN1_ZERO_C)).level, "0");
+        assert_ne!(c.update(1.0, &at(SEN1_ZERO_C + 1.0)).level, "0");
+        // one degree under the cut: full speed at once
+        assert_eq!(c.update(1.0, &at(SEN1_FULL_C)).level, FULL_SPEED);
+    }
+
+    #[test]
+    fn the_sen1_demand_falls_slowly() {
+        let mut c = Curve::new();
+        let at = |sen1| Inputs {
+            sen1_c: Some(sen1),
+            ..cool(55.0, Some(6.0))
+        };
+        c.update(1.0, &at(SEN1_FULL_C));
+        // SEN1 one degree lower: the demand does not drop to its new value at once
+        let d = c.update(1.0, &at(SEN1_FULL_C - 1.0));
+        assert!(d.need_sen1 > 0.95, "need_sen1 {}", d.need_sen1);
+        for _ in 0..120 {
+            c.update(1.0, &at(45.0));
+        }
+        assert_eq!(c.update(1.0, &at(45.0)).level, "0");
+    }
+
+    #[test]
+    fn a_pl1_cut_keeps_the_power_demand() {
+        let mut c = Curve::new();
+        for _ in 0..60 {
+            c.update(1.0, &cool(70.0, Some(25.0)));
+        }
+        let before = c.update(1.0, &cool(70.0, Some(25.0))).need_power;
+        // The EC cuts PL1: power falls to 12 W, the package cools a little
+        let cut = Inputs {
+            pl1_cut: true,
+            ..cool(66.0, Some(12.0))
+        };
+        for _ in 0..60 {
+            c.update(1.0, &cut);
+        }
+        assert_eq!(c.update(1.0, &cut).need_power, before);
+        // Once PL1 is back, the power demand follows the power again
+        for _ in 0..60 {
+            c.update(1.0, &cool(60.0, Some(6.0)));
+        }
+        assert_eq!(c.update(1.0, &cool(60.0, Some(6.0))).need_power, 0.0);
     }
 
     #[test]

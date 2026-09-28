@@ -68,28 +68,53 @@ pub fn cpu_temp(sensor: &Path) -> Option<f64> {
     read_i64(sensor).map(|t| t as f64 / 1000.0)
 }
 
-/// Board sensors SEN1, SEN2, … (thermal zones). Their critical trip is 80 °C,
-/// where the kernel powers the machine off.
-pub fn find_sen_sensors() -> Vec<PathBuf> {
+/// In the `performance` profile, the EC cuts PL1 from 40 to 12 W when SEN1
+/// reaches this (firmware DTT policy, measured on 2026-09-25)
+pub const SEN1_PL1_CUT_C: f64 = 54.0;
+
+/// A board sensor: SEN1, SEN2, … (thermal zones). Their critical trip is
+/// 80 °C, where the kernel powers the machine off. SEN1 is the one the EC
+/// watches for the PL1 cut.
+pub struct SenSensor {
+    pub name: String,
+    path: PathBuf,
+}
+
+impl SenSensor {
+    pub fn temp(&self) -> Option<f64> {
+        cpu_temp(&self.path)
+    }
+}
+
+/// Board sensors, sorted by name
+pub fn find_sen_sensors() -> Vec<SenSensor> {
     let Ok(entries) = fs::read_dir("/sys/class/thermal/") else {
         return Vec::new();
     };
-    let mut sensors: Vec<PathBuf> = entries
+    let mut sensors: Vec<SenSensor> = entries
         .flatten()
-        .filter(|e| {
-            read_string(e.path().join("type")).is_some_and(|t| t.starts_with("SEN"))
+        .filter_map(|e| {
+            let name = read_string(e.path().join("type")).filter(|t| t.starts_with("SEN"))?;
+            Some(SenSensor {
+                name,
+                path: e.path().join("temp"),
+            })
         })
-        .map(|e| e.path().join("temp"))
         .collect();
-    sensors.sort();
+    sensors.sort_by(|a, b| a.name.cmp(&b.name));
     sensors
 }
 
+/// Temperature of the board sensor with this name; None if missing or unreadable
+pub fn sen_temp(sensors: &[SenSensor], name: &str) -> Option<f64> {
+    sensors.iter().find(|s| s.name == name)?.temp()
+}
+
 /// Hottest board sensor among those that read; None if none does
-pub fn max_sen_temp(sensors: &[PathBuf]) -> Option<f64> {
+pub fn max_sen_temp(sensors: &[SenSensor]) -> Option<f64> {
     sensors
         .iter()
-        .filter_map(|p| cpu_temp(p))
+        .filter_map(SenSensor::temp)
         .reduce(f64::max)
 }
 

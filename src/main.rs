@@ -129,13 +129,17 @@ struct Sample {
     rapl_power_w: f64,
     platform_profile: String,
     pl1_w: Option<f64>,
+    /// The EC has lowered PL1 below what the profile set
+    pl1_cut: bool,
+    sen1_c: Option<f64>,
+    sen2_c: Option<f64>,
     fan_mode: &'static str,
     fan_need: f64,
 }
 
 impl Sample {
     fn csv_header() -> &'static str {
-        "timestamp,temp_c,temp_rate,cpu_load,fan1_rpm,fan2_rpm,fan_level,freq_min,freq_avg,freq_max,freq_cap_mhz,epp,throttle_rate,rapl_power_w,platform_profile,pl1_w,fan_mode,fan_need"
+        "timestamp,temp_c,temp_rate,cpu_load,fan1_rpm,fan2_rpm,fan_level,freq_min,freq_avg,freq_max,freq_cap_mhz,epp,throttle_rate,rapl_power_w,platform_profile,pl1_w,fan_mode,fan_need,sen1_c,sen2_c"
     }
 
     fn to_csv_row(&self) -> String {
@@ -145,7 +149,7 @@ impl Sample {
             .unwrap_or_default()
             .as_secs();
         format!(
-            "{},{:.1},{:.2},{:.3},{},{},{},{},{},{},{},{},{:.1},{:.2},{},{},{},{:.2}",
+            "{},{:.1},{:.2},{:.3},{},{},{},{},{},{},{},{},{:.1},{:.2},{},{},{},{:.2},{},{}",
             ts,
             self.temp_c,
             self.temp_rate,
@@ -164,8 +168,15 @@ impl Sample {
             self.pl1_w.map_or(String::new(), |w| format!("{w:.0}")),
             self.fan_mode,
             self.fan_need,
+            fmt_opt_c(self.sen1_c),
+            fmt_opt_c(self.sen2_c),
         )
     }
+}
+
+/// Whole degrees (the SEN sensors read in whole degrees), empty when unknown
+fn fmt_opt_c(t: Option<f64>) -> String {
+    t.map_or(String::new(), |t| format!("{t:.0}"))
 }
 
 // =============================================================================
@@ -208,10 +219,8 @@ struct EventDetector {
     above_95: bool,
     // Rapid temp rise: count consecutive samples with rate > 2
     rapid_rise_count: usize,
-    // PL1 cut: a drop of PL1 with no recent profile change (the EC lowering
-    // it). The firmware may apply a new profile's PL1 a few ticks late.
-    prev_pl1: Option<f64>,
-    profile: Option<(String, Instant)>,
+    // PL1 cut: fires when a cut starts
+    was_cut: bool,
 }
 
 impl EventDetector {
@@ -229,8 +238,7 @@ impl EventDetector {
             above_90: false,
             above_95: false,
             rapid_rise_count: 0,
-            prev_pl1: None,
-            profile: None,
+            was_cut: false,
         }
     }
 
@@ -301,21 +309,10 @@ impl EventDetector {
         }
 
         // PL1 cut by the EC: the CPU will be clamped once its power budget is spent
-        if self.profile.as_ref().map(|(p, _)| p) != Some(&sample.platform_profile) {
-            self.profile = Some((sample.platform_profile.clone(), Instant::now()));
+        if sample.pl1_cut && !self.was_cut && self.can_fire(EventType::Pl1Cut) {
+            events.push(EventType::Pl1Cut);
         }
-        let profile_settled = self
-            .profile
-            .as_ref()
-            .is_some_and(|(_, since)| since.elapsed() >= Duration::from_secs(PROFILE_SETTLE_SECS));
-        if let Some(pl1) = sample.pl1_w {
-            if let Some(prev) = self.prev_pl1 {
-                if pl1 < prev - 0.5 && profile_settled && self.can_fire(EventType::Pl1Cut) {
-                    events.push(EventType::Pl1Cut);
-                }
-            }
-            self.prev_pl1 = Some(pl1);
-        }
+        self.was_cut = sample.pl1_cut;
 
         // Mark all fired events
         for &e in &events {
@@ -323,6 +320,49 @@ impl EventDetector {
         }
 
         events
+    }
+}
+
+// =============================================================================
+// PL1 cut detection
+// =============================================================================
+
+/// Is PL1 cut by the EC now? The profile sets PL1 (10 / 15 / 40 W here); a
+/// lower PL1 under the same profile is the EC's cut. The profile's own PL1 is
+/// the highest one seen since the profile changed. The firmware may apply a
+/// new profile's PL1 a few ticks late, so PL1 is not watched for
+/// PROFILE_SETTLE_SECS after a change.
+struct Pl1Watch {
+    profile: Option<(String, Instant)>,
+    profile_pl1_w: Option<f64>,
+}
+
+impl Pl1Watch {
+    fn new() -> Self {
+        Self {
+            profile: None,
+            profile_pl1_w: None,
+        }
+    }
+
+    fn update(&mut self, profile: &str, pl1_w: Option<f64>) -> bool {
+        self.update_at(Instant::now(), profile, pl1_w)
+    }
+
+    fn update_at(&mut self, now: Instant, profile: &str, pl1_w: Option<f64>) -> bool {
+        if self.profile.as_ref().map(|(p, _)| p.as_str()) != Some(profile) {
+            self.profile = Some((profile.to_string(), now));
+            self.profile_pl1_w = None;
+        }
+        let settled = self.profile.as_ref().is_some_and(|(_, since)| {
+            now.duration_since(*since) >= Duration::from_secs(PROFILE_SETTLE_SECS)
+        });
+        let Some(pl1) = pl1_w.filter(|_| settled) else {
+            return false;
+        };
+        let profile_pl1 = self.profile_pl1_w.map_or(pl1, |p| p.max(pl1));
+        self.profile_pl1_w = Some(profile_pl1);
+        pl1 < profile_pl1 - 0.5
     }
 }
 
@@ -467,6 +507,15 @@ enum FanControl {
     HandsOff,
 }
 
+/// The other readings the fan driver needs; None when unreadable
+struct FanSensors {
+    power_w: Option<f64>,
+    sen1_c: Option<f64>,
+    /// Hottest board sensor, for the hard limit
+    sen_max_c: Option<f64>,
+    pl1_cut: bool,
+}
+
 struct FanDriver {
     curve: Curve,
     control: Option<FanControl>,
@@ -484,21 +533,25 @@ impl FanDriver {
 
     /// One tick. `temp_c` is a fresh read (None when it failed), not the
     /// observer's reused last value.
-    fn tick(
-        &mut self,
-        dt: f64,
-        temp_c: Option<f64>,
-        power_w: Option<f64>,
-        sen_max_c: Option<f64>,
-    ) -> Status {
+    fn tick(&mut self, dt: f64, temp_c: Option<f64>, sensors: &FanSensors) -> Status {
         let mut mode = FanMode::read();
         // The curve runs in every mode, so its state is ready when the mode
         // comes back to curve
-        let guard = fan_curve::guard(temp_c, sen_max_c);
+        let guard = fan_curve::guard(temp_c, sensors.sen_max_c);
         if guard.is_some() {
             self.curve.force_full();
         }
-        let decision = temp_c.map(|t| self.curve.update(dt, t, power_w));
+        let decision = temp_c.map(|temp_c| {
+            self.curve.update(
+                dt,
+                &fan_curve::Inputs {
+                    temp_c,
+                    power_w: sensors.power_w,
+                    sen1_c: sensors.sen1_c,
+                    pl1_cut: sensors.pl1_cut,
+                },
+            )
+        });
 
         let level = if !hw::fan_control_enabled() {
             // Fan commands would fail: the EC keeps the fan anyway
@@ -538,11 +591,13 @@ impl FanDriver {
             log(
                 "fan",
                 &format!(
-                    "Level {} (need {:.2}: power {:.2}, temp {:.2}{})",
+                    "Level {} (need {:.2}: power {:.2}, temp {:.2}, sen1 {:.2}{}{})",
                     level.unwrap_or("-"),
                     decision.as_ref().map_or(0.0, |d| d.need),
                     decision.as_ref().map_or(0.0, |d| d.need_power),
                     decision.as_ref().map_or(0.0, |d| d.need_temp),
+                    decision.as_ref().map_or(0.0, |d| d.need_sen1),
+                    if sensors.pl1_cut { ", PL1 cut" } else { "" },
                     guard.as_ref().map_or(String::new(), |g| format!(", hard limit: {g}")),
                 ),
             );
@@ -556,6 +611,7 @@ impl FanDriver {
             need: decision.as_ref().map_or(0.0, |d| d.need),
             need_power: decision.as_ref().map_or(0.0, |d| d.need_power),
             need_temp: decision.as_ref().map_or(0.0, |d| d.need_temp),
+            need_sen1: decision.as_ref().map_or(0.0, |d| d.need_sen1),
             guard,
         }
     }
@@ -597,6 +653,7 @@ struct MinuteStats {
     /// Seconds with max frequency under the cap while busy (see `record`)
     drop_s: u32,
     pl1_min_w: Option<f64>,
+    sen1_max_c: Option<f64>,
 }
 
 impl MinuteStats {
@@ -615,16 +672,20 @@ impl MinuteStats {
         if let Some(w) = s.pl1_w {
             self.pl1_min_w = Some(self.pl1_min_w.map_or(w, |m| m.min(w)));
         }
+        if let Some(t) = s.sen1_c {
+            self.sen1_max_c = Some(self.sen1_max_c.map_or(t, |m| m.max(t)));
+        }
     }
 
     fn summary(&self) -> String {
         let n = self.samples.max(1);
         format!(
-            "rpm_avg={} fan_off={}% drop_s={} pl1_min={}",
+            "rpm_avg={} fan_off={}% drop_s={} pl1_min={} sen1_max={}",
             self.rpm_sum / n as u64,
             self.fan_off * 100 / n,
             self.drop_s,
             self.pl1_min_w.map_or("?".into(), |w| format!("{w:.0}W")),
+            self.sen1_max_c.map_or("?".into(), |t| format!("{t:.0}°C")),
         )
     }
 }
@@ -707,6 +768,7 @@ fn observer(stop: &AtomicBool) {
     let mut buffer: VecDeque<Sample> = VecDeque::with_capacity(BUFFER_CAPACITY);
     let mut detector = EventDetector::new();
     let mut fan_driver = FanDriver::new();
+    let mut pl1_watch = Pl1Watch::new();
     let mut minute = MinuteStats::default();
     let mut prev_tick = Instant::now();
     let mut tick: u64 = 0;
@@ -746,6 +808,9 @@ fn observer(stop: &AtomicBool) {
         let epp = epp_r.clone().unwrap_or_else(|| "unknown".into());
         let profile = profile_r.clone().unwrap_or_else(|| "unknown".into());
         let pl1_w = hw::read_pl1_w();
+        let pl1_cut = pl1_watch.update(&profile, pl1_w);
+        let sen1_c = hw::sen_temp(&sen_sensors, "SEN1");
+        let sen2_c = hw::sen_temp(&sen_sensors, "SEN2");
         let throttle_rate = throttle.sample().unwrap_or(0.0);
         let rapl_r = rapl.sample();
         let rapl_w = rapl_r.unwrap_or(0.0);
@@ -754,7 +819,16 @@ fn observer(stop: &AtomicBool) {
         let now = Instant::now();
         let dt = now.duration_since(prev_tick).as_secs_f64();
         prev_tick = now;
-        let fan_status = fan_driver.tick(dt, temp_fresh, rapl_r, hw::max_sen_temp(&sen_sensors));
+        let fan_status = fan_driver.tick(
+            dt,
+            temp_fresh,
+            &FanSensors {
+                power_w: rapl_r,
+                sen1_c,
+                sen_max_c: hw::max_sen_temp(&sen_sensors),
+                pl1_cut,
+            },
+        );
         if let Err(e) = fan_status.write() {
             if tick == 0 {
                 log("fan", &format!("WARNING: cannot write the status for hw-tui: {e}"));
@@ -778,6 +852,9 @@ fn observer(stop: &AtomicBool) {
             rapl_power_w: rapl_w,
             platform_profile: profile.clone(),
             pl1_w,
+            pl1_cut,
+            sen1_c,
+            sen2_c,
             fan_mode: fan_status.mode.as_str(),
             fan_need: fan_status.need,
         };
@@ -823,12 +900,16 @@ fn observer(stop: &AtomicBool) {
             log(
                 "status",
                 &format!(
-                    "{:.0}°C Δ{:+.1}°C/s load={:.0}% fan={} ({}, need {:.2}) rpm={}/{} freq={}/{}/{} cap={} epp={} profile={} pl1={} rapl={:.1}W | last min: {}",
+                    "{:.0}°C Δ{:+.1}°C/s load={:.0}% fan={} ({}, need {:.2}) rpm={}/{} freq={}/{}/{} cap={} epp={} profile={} pl1={}{} rapl={:.1}W sen1={} sen2={} | last min: {}",
                     temp, temp_rate, load * 100.0,
                     fan_level, fan_status.mode.as_str(), fan_status.need, f1, f2,
                     sample.freq_min, sample.freq_avg, sample.freq_max,
                     freq_cap, epp, profile,
-                    pl1_w.map_or("?".into(), |w| format!("{w:.0}W")), rapl_w,
+                    pl1_w.map_or("?".into(), |w| format!("{w:.0}W")),
+                    if pl1_cut { " (cut)" } else { "" },
+                    rapl_w,
+                    sen1_c.map_or("?".into(), |t| format!("{t:.0}°C")),
+                    sen2_c.map_or("?".into(), |t| format!("{t:.0}°C")),
                     minute.summary(),
                 ),
             );
@@ -903,6 +984,9 @@ mod tests {
             rapl_power_w: 0.0,
             platform_profile: "performance".into(),
             pl1_w: Some(40.0),
+            pl1_cut: false,
+            sen1_c: Some(45.0),
+            sen2_c: Some(48.0),
             fan_mode: "curve",
             fan_need: 0.0,
         }
@@ -934,23 +1018,39 @@ mod tests {
     }
 
     #[test]
-    fn pl1_cut_fires_on_a_drop_but_not_on_a_profile_change() {
-        let mut d = EventDetector::new();
-        let with = |pl1: f64, profile: &str| Sample {
-            pl1_w: Some(pl1),
-            platform_profile: profile.into(),
-            ..sample(60.0, 0.0, 0.0)
-        };
-        assert!(d.detect(&with(40.0, "performance")).is_empty());
+    fn pl1_watch_sees_a_cut_but_not_a_profile_change() {
+        let mut w = Pl1Watch::new();
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        assert!(!w.update_at(at(0), "performance", Some(40.0)));
+        assert!(!w.update_at(at(10), "performance", Some(40.0)));
         // the user switches profile: PL1 follows, that is not a cut, even
         // when the firmware applies the new PL1 one tick late
-        assert!(d.detect(&with(40.0, "balanced")).is_empty());
-        assert!(d.detect(&with(15.0, "balanced")).is_empty());
-        assert!(d.detect(&with(40.0, "performance")).is_empty());
+        assert!(!w.update_at(at(11), "balanced", Some(40.0)));
+        assert!(!w.update_at(at(12), "balanced", Some(15.0)));
+        assert!(!w.update_at(at(20), "balanced", Some(15.0)));
+        assert!(!w.update_at(at(21), "performance", Some(15.0)));
+        assert!(!w.update_at(at(22), "performance", Some(40.0)));
+        assert!(!w.update_at(at(30), "performance", Some(40.0)));
         // the profile has been stable for a while, then the EC lowers PL1
-        let settled = Instant::now().checked_sub(Duration::from_secs(10)).unwrap();
-        d.profile = Some(("performance".into(), settled));
-        assert_eq!(d.detect(&with(12.0, "performance")), vec![EventType::Pl1Cut]);
+        assert!(w.update_at(at(31), "performance", Some(12.0)));
+        assert!(w.update_at(at(90), "performance", Some(12.0)));
+        assert!(!w.update_at(at(91), "performance", Some(40.0)));
+        // an unreadable PL1 is not a cut
+        assert!(!w.update_at(at(92), "performance", None));
+    }
+
+    #[test]
+    fn pl1_cut_fires_when_a_cut_starts() {
+        let mut d = EventDetector::new();
+        let with = |pl1_cut| Sample {
+            pl1_cut,
+            ..sample(60.0, 0.0, 0.0)
+        };
+        assert!(d.detect(&with(false)).is_empty());
+        assert_eq!(d.detect(&with(true)), vec![EventType::Pl1Cut]);
+        // the same cut, still going: no new event
+        assert!(d.detect(&with(true)).is_empty());
     }
 
     #[test]

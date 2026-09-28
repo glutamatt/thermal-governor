@@ -11,7 +11,7 @@ The X1 Carbon's firmware fan curve is essentially binary (off or near-max). With
 
 A steady cap (2000 MHz) kills that cycle. Two things were still wrong:
 
-- **Max frequency drops without any thermal throttle.** The firmware limits package power (PL1): 15 W in the `balanced` platform profile, 40 W in `performance`. Past PL1 for ~28 s, the CPU falls to 400 MHz. Even in `performance`, the EC cuts PL1 to 12 W when the package gets hot (seen from 77 °C, never below 75 °C).
+- **Max frequency drops without any thermal throttle.** The firmware limits package power (PL1): 15 W in the `balanced` platform profile, 40 W in `performance`. Past PL1 for ~28 s, the CPU falls to 400 MHz. Even in `performance`, the EC cuts PL1 to 12 W when the board sensor SEN1 reaches 54 °C. The package temperature does not predict it (cuts seen from 68 °C to 88 °C package).
 - **The EC fan control is on/off** (on at ~55 °C, off at ~52 °C): at cap 2000 it ran 81 % of the time for a CPU at 6 W.
 
 The measurements are in `.claude/skills/thermal-governor/SKILL.md`.
@@ -20,20 +20,23 @@ The measurements are in `.claude/skills/thermal-governor/SKILL.md`.
 
 The first version was an **active controller** on the frequency cap, with a self-tuner on top. The tuner had too little signal and its choices felt arbitrary. The next phase turned the daemon into a passive observer, to collect data for a better auto-tuner. That auto-tuner is **abandoned**: tuning by hand with `hw-tui` works well.
 
-What came back is much smaller: a **fan curve** with five fixed numbers, built on measurements, not on learning.
+What came back is much smaller: a **fan curve** with a few fixed numbers, built on measurements, not on learning.
 
 ## Fan curve
 
-Every second, two linear demands between 0 and 1:
+Every second, three linear demands between 0 and 1:
 
 ```
 need_power = (package power, smoothed over 10 s − 9 W) / (23 W − 9 W)
 need_temp  = (package temperature, smoothed over 8 s − 62 °C) / (74 °C − 62 °C)
-need       = max(need_power, need_temp)          clamped to 0..1
+need_sen1  = (SEN1 − 50 °C) / (53 °C − 50 °C)      up at once, down with a 60 s time constant
+need       = max(need_power, need_temp, need_sen1)          each clamped to 0..1
 ```
 
 - **Power acts first**: heat is coming before the temperature shows it (at 25 W the package goes from 70 to 77 °C in ~15 s). RAPL package power includes the iGPU, which video decode loads.
-- **Temperature corrects**: full speed at 74 °C, under the 75 °C limit where PL1 cuts start.
+- **Temperature corrects**: full speed at 74 °C. It reacts in seconds, but it does not predict the PL1 cut.
+- **SEN1 is the target**: the EC cuts PL1 when this board sensor reaches 54 °C, so the curve is at full speed at 53 °C. SEN1 is slow: it keeps the heat of past loads for minutes, so it raises the fan even when the package is cool. It reads in whole degrees, and its demand falls slowly, so a sensor between two degrees does not move the fan up and down.
+- **During a PL1 cut, the power demand does not fall**: PL1 caps the power at 12 W, but that does not mean the machine is cooler. Lowering the fan then would keep SEN1 hot, and the cut going. A cut is a PL1 lower than the highest PL1 seen since the last profile change.
 - **Smooth the inputs, not the demand**: the package temperature jumps by several °C in 1–2 s with short bursts of load. The 8 s smoothing keeps these jumps from starting the fan; PL1 cuts come from sustained heat. `need` then follows the inputs both ways: after a full load the fan stops in ~15 s. A load that comes back starts the fan again.
 - `need × 9540 RPM` maps to the nearest of the 9 fan levels (0–7, `disengaged`), by their measured RPM, with a 150 RPM hysteresis.
 - **Hard limits**, in curve and manual mode: package ≥ 80 °C or a board sensor (SEN) ≥ 70 °C → full speed at once, then the demand falls with a 30 s time constant (a sensor hovering at the limit does not flip the fan every second). The kernel powers the machine off at SEN 80 °C.
@@ -54,6 +57,8 @@ The mode lives in `/run/thermal-governor/fan-mode`, so **every boot starts on th
 ## `hw-tui`
 
 A terminal UI with six live charts (temperature, fan RPM, power, throttle, CPU usage, frequency min/avg/max with the cap as a dotted line).
+
+The temperature chart also shows SEN1, the board sensor the EC watches for the PL1 cut, with the cut threshold (54 °C) as a dotted line in the same color. SEN1 turns red in the title one degree under the cut.
 
 The power chart also shows the package power averaged over the PL1 time window (tau, 28 s here), and PL1 itself as a dotted line. Both come from `intel-rapl-mmio:0`. PL1 limits this average, not the power itself. When the average reaches the line, its value turns red: max frequency will drop to ~400 MHz soon. The firmware clamps later than this average predicts (up to ~35 s later in the tests), so read it as an early warning.
 
@@ -80,7 +85,7 @@ The power chart also shows the package power averaged over the PL1 time window (
 - **Settings persistence**: when the platform profile, cap or EPP changes (from `hw-tui` or any tool writing the same sysfs files), it saves them to `/var/lib/thermal-governor/settings.json`. At startup, it restores them. With no saved file, it leaves the hardware as it is. The fan level is never saved: manual levels last one boot.
 - **Clean shutdown**: on stop, the fan goes back to the EC. Profile, cap and EPP are not touched, so a restart does not undo your tuning.
 - **Event log**: samples at 1 Hz into a 5-minute rolling buffer. On a notable event, it writes the buffer as a CSV to `/var/lib/thermal-governor/events/`. Only the newest 1000 files are kept.
-- **Per-minute status** in the journal: average RPM, % of time with the fan off, seconds of frequency drop, lowest PL1.
+- **Per-minute status** in the journal: SEN1 and SEN2 now; over the last minute, average RPM, % of time with the fan off, seconds of frequency drop, lowest PL1, highest SEN1.
 
 ### Events captured
 
@@ -91,12 +96,12 @@ The power chart also shows the package power averaged over the PL1 time window (
 | `temp-cross-90`    | …crossed 90 °C |
 | `temp-cross-95`    | …crossed 95 °C |
 | `rapid-temp-rise`  | Temperature rising faster than 2 °C/s for 3 samples |
-| `pl1-cut`          | The EC lowered PL1 with no profile change: a frequency drop is coming |
+| `pl1-cut`          | A PL1 cut starts: PL1 is lower than what the profile set (the EC lowered it). A frequency drop is coming |
 
 Each event type has a 60 s cooldown. File name: `<unix-timestamp>-<event>.csv`. Columns:
 
 ```
-timestamp,temp_c,temp_rate,cpu_load,fan1_rpm,fan2_rpm,fan_level,freq_min,freq_avg,freq_max,freq_cap_mhz,epp,throttle_rate,rapl_power_w,platform_profile,pl1_w,fan_mode,fan_need
+timestamp,temp_c,temp_rate,cpu_load,fan1_rpm,fan2_rpm,fan_level,freq_min,freq_avg,freq_max,freq_cap_mhz,epp,throttle_rate,rapl_power_w,platform_profile,pl1_w,fan_mode,fan_need,sen1_c,sen2_c
 ```
 
 ## Architecture
@@ -148,9 +153,9 @@ Example output:
 [08:58:09] [obs] Restoring settings: Settings { freq_cap_mhz: 2000, epp: "performance", platform_profile: Some("performance") }
 [08:58:09] [obs] Observer loop started (1Hz sampling, 300-sample buffer)
 [08:58:09] [fan] Fan control: Curve
-[08:58:09] [fan] Level 0 (need 0.00: power 0.00, temp 0.00)
-[09:02:14] [fan] Level 2 (need 0.33: power 0.33, temp 0.08)
-[09:03:09] [status] 63°C Δ+0.1°C/s load=40% fan=2 (curve, need 0.31) rpm=4838/4120 … | last min: rpm_avg=3950 fan_off=20% drop_s=0 pl1_min=40W
+[08:58:09] [fan] Level 0 (need 0.00: power 0.00, temp 0.00, sen1 0.00)
+[09:02:14] [fan] Level 2 (need 0.33: power 0.33, temp 0.08, sen1 0.00)
+[09:03:09] [status] 63°C Δ+0.1°C/s load=40% fan=2 (curve, need 0.31) rpm=4838/4120 … pl1=40W rapl=13.2W sen1=49°C sen2=53°C | last min: rpm_avg=3950 fan_off=20% drop_s=0 pl1_min=40W sen1_max=49°C
 ```
 
 ## Hardware characterization
