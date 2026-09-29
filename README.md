@@ -56,9 +56,12 @@ The mode lives in `/run/thermal-governor/fan-mode`, so **every boot starts on th
 
 ## `hw-tui`
 
-A terminal UI with six live charts (temperature, fan RPM, power, throttle, CPU usage, frequency min/avg/max with the cap as a dotted line).
+A terminal UI with seven live charts. They show the last 2 minutes: PL1 limits a 28 s average, so a cut and its cause fit on the same screen.
 
-The temperature chart also shows SEN1, the board sensor the EC watches for the PL1 cut, with the cut threshold (54 °C) as a dotted line in the same color. SEN1 turns red in the title one degree under the cut.
+- Bars, one series each: package temperature (85 and 95 °C dotted), SEN1, fan RPM, throttle, CPU usage. The color of a bar means a value, not a height: a color is the same value whatever the y range.
+- Lines, several series each: power, and frequency avg/max with the cap as a dotted line. Frequency min is not shown (a core at rest keeps it near 400 MHz), but it stays in the CSV.
+
+SEN1, the board sensor the EC watches for the PL1 cut, has its own chart: it moves by a degree or two where the package moves by tens. The chart always shows the cut (54 °C) as a dotted line, and covers 5 minutes: SEN1 reads in whole degrees and moves ~1 °C per minute, so 2 minutes show no trend. Its bars go from cyan to red where the fan curve goes from SEN1 ignored to full speed (50 to 53 °C), and SEN1 turns red in the title one degree under the cut.
 
 The power chart also shows the package power averaged over the PL1 time window (tau, 28 s here), and PL1 itself as a dotted line. Both come from `intel-rapl-mmio:0`. PL1 limits this average, not the power itself. When the average reaches the line, its value turns red: max frequency will drop to ~400 MHz soon. The firmware clamps later than this average predicts (up to ~35 s later in the tests), so read it as an early warning.
 

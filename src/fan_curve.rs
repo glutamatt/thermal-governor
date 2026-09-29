@@ -42,8 +42,8 @@ const TEMP_TAU_S: f64 = 8.0;
 /// SEN1 demand: none below SEN1_ZERO_C, full speed at SEN1_FULL_C, one
 /// degree under the 54 °C cut. SEN1 reads in whole degrees and moves ~1 °C
 /// per 15–60 s under load, so it needs no smoothing.
-const SEN1_ZERO_C: f64 = 50.0;
-const SEN1_FULL_C: f64 = hw::SEN1_PL1_CUT_C - 1.0;
+pub const SEN1_ZERO_C: f64 = 50.0;
+pub const SEN1_FULL_C: f64 = hw::SEN1_PL1_CUT_C - 1.0;
 /// SEN1 cools slowly: the demand it set falls with this time constant, so a
 /// sensor between two whole degrees does not move the fan up and down
 const SEN1_FALL_TAU_S: f64 = 60.0;

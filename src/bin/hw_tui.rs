@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use thermal_governor::clock::{self, LocalTime};
 use thermal_governor::fan_curve::{self, FanMode, Status};
 use thermal_governor::hw::{self, FanSensor};
+use tui_bar_graph::{BarGraph, BarStyle, ColorMode};
 
 // =============================================================================
 // Constants
@@ -31,7 +32,12 @@ use thermal_governor::hw::{self, FanSensor};
 
 const FAN_LEVELS: &[&str] = &["0", "1", "2", "3", "4", "5", "6", "7", "disengaged"];
 
-const HISTORY_CAP: usize = 300; // 5 minutes at 1Hz
+// Time shown by the charts, in s. PL1 limits a 28 s average: 2 min shows a
+// cut and its cause on the same screen.
+const WINDOW_S: f64 = 120.0;
+// SEN1 moves ~1 °C per minute and reads in whole degrees: on 2 min it
+// shows one or two steps, no trend
+const SEN1_WINDOW_S: f64 = 300.0;
 const SAMPLE_PERIOD: Duration = Duration::from_secs(1);
 // Spacing of the dots of a dotted line, in s of x range
 const DOTTED_STEP_S: f64 = 3.0;
@@ -46,20 +52,23 @@ const EPP_VALUES: &[&str] = &["power", "balance_power", "balance_performance", "
 // TimeSeries
 // =============================================================================
 
+/// The points of the last `window_s` seconds
 struct TimeSeries {
     data: VecDeque<(f64, f64)>,
+    window_s: f64,
 }
 
 impl TimeSeries {
-    fn new() -> Self {
+    fn new(window_s: f64) -> Self {
         Self {
-            data: VecDeque::with_capacity(HISTORY_CAP + 1),
+            data: VecDeque::new(),
+            window_s,
         }
     }
 
     fn push(&mut self, elapsed: f64, value: f64) {
         self.data.push_back((elapsed, value));
-        if self.data.len() > HISTORY_CAP {
+        while self.data.front().is_some_and(|&(x, _)| x < elapsed - self.window_s) {
             self.data.pop_front();
         }
     }
@@ -106,13 +115,35 @@ impl TimeSeries {
         [lo, hi]
     }
 
+    /// The whole window, ending at the newest point: the time scale does not
+    /// change while the window fills up after start
     fn x_bounds(&self) -> [f64; 2] {
-        if self.data.is_empty() {
-            return [0.0, 300.0];
+        let last = self.last_x().unwrap_or(0.0);
+        [last - self.window_s, last]
+    }
+
+    /// The window as `n` bars, oldest first. Each bar is the highest point
+    /// of its slot of time, so a short peak stays visible. A slot with no
+    /// point keeps the bar before it; before the first point, None.
+    fn bars(&self, n: usize) -> Vec<Option<f64>> {
+        let mut bars = vec![None; n];
+        if n == 0 {
+            return bars;
         }
-        let last = self.data.back().unwrap().0;
-        let first = (last - 300.0).max(0.0);
-        [first, last]
+        let [x0, x1] = self.x_bounds();
+        let slot_s = (x1 - x0) / n as f64;
+        for &(x, v) in &self.data {
+            let i = (((x - x0) / slot_s) as usize).min(n - 1);
+            bars[i] = Some(bars[i].map_or(v, |b: f64| b.max(v)));
+        }
+        let mut prev = None;
+        for bar in &mut bars {
+            if bar.is_none() {
+                *bar = prev;
+            }
+            prev = *bar;
+        }
+        bars
     }
 }
 
@@ -168,7 +199,6 @@ struct App {
     pl1: TimeSeries,
     sys_power: TimeSeries,
     rest_power: TimeSeries,
-    freq_min: TimeSeries,
     freq_avg: TimeSeries,
     freq_max: TimeSeries,
 
@@ -251,19 +281,18 @@ impl App {
             .unwrap_or(0);
 
         Self {
-            temp: TimeSeries::new(),
-            sen1: TimeSeries::new(),
-            fan: TimeSeries::new(),
-            throttle_rate: TimeSeries::new(),
-            cpu_usage: TimeSeries::new(),
-            power: TimeSeries::new(),
-            power_avg: TimeSeries::new(),
-            pl1: TimeSeries::new(),
-            sys_power: TimeSeries::new(),
-            rest_power: TimeSeries::new(),
-            freq_min: TimeSeries::new(),
-            freq_avg: TimeSeries::new(),
-            freq_max: TimeSeries::new(),
+            temp: TimeSeries::new(WINDOW_S),
+            sen1: TimeSeries::new(SEN1_WINDOW_S),
+            fan: TimeSeries::new(WINDOW_S),
+            throttle_rate: TimeSeries::new(WINDOW_S),
+            cpu_usage: TimeSeries::new(WINDOW_S),
+            power: TimeSeries::new(WINDOW_S),
+            power_avg: TimeSeries::new(WINDOW_S),
+            pl1: TimeSeries::new(WINDOW_S),
+            sys_power: TimeSeries::new(WINDOW_S),
+            rest_power: TimeSeries::new(WINDOW_S),
+            freq_avg: TimeSeries::new(WINDOW_S),
+            freq_max: TimeSeries::new(WINDOW_S),
 
             stress_idx: 0,
             cap_steps: cap_steps(cap_top),
@@ -391,12 +420,11 @@ impl App {
             self.rest_power.push(elapsed, rest);
         }
 
-        // Freq (all cores: min/avg/max) + cap + EPP
+        // Freq (all cores: min/avg/max; min only goes to the CSV) + cap + EPP
         let freqs = hw::read_freqs(&self.cpufreq_dirs);
         self.cur_freq_min = freqs.as_ref().map_or(0, |f| f.min);
         self.cur_freq_avg = freqs.as_ref().map_or(0, |f| f.avg);
         self.cur_freq_max = freqs.as_ref().map_or(0, |f| f.max);
-        self.freq_min.push(elapsed, self.cur_freq_min as f64);
         self.freq_avg.push(elapsed, self.cur_freq_avg as f64);
         self.freq_max.push(elapsed, self.cur_freq_max as f64);
         self.cur_cap = hw::read_freq_cap(&self.cpufreq_dirs);
@@ -718,25 +746,19 @@ fn draw_charts(frame: &mut Frame, area: Rect, app: &App) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
+    // Heat and cooling on top, load below
     let top = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(33),
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-        ])
+        .constraints([Constraint::Ratio(1, 4); 4])
         .split(rows[0]);
 
     let bot = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(33),
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-        ])
+        .constraints([Constraint::Ratio(1, 3); 3])
         .split(rows[1]);
 
     draw_temp_chart(frame, top[0], app);
+    draw_sen1_chart(frame, top[1], app);
 
     let fan_emoji = if app.cur_fan >= 4000 {
         "🌪️"
@@ -745,36 +767,33 @@ fn draw_charts(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         "🤫"
     };
-    draw_chart(
+    draw_bar_chart(
         frame,
-        top[1],
-        ChartSpec {
-            title: format!(" {fan_emoji} Fan  {} RPM ", app.cur_fan),
-            series: &app.fan,
-            color: Color::Cyan,
+        top[2],
+        BarSpec {
+            title: title_line(format!(" {fan_emoji} Fan  {} RPM ", app.cur_fan), Color::Cyan),
             border_color: Color::Cyan,
-            y_min: 0.0,
-            y_max: 7000.0,
-            y_pad: 200.0,
+            series: &app.fan,
+            y_bounds: [0.0, app.fan.y_bounds(0.0, 7000.0, 200.0)[1]],
+            gradient: &[(0.0, "#155e75"), (3000.0, "#06b6d4"), (7000.0, "#a5f3fc")],
             ref_lines: &[],
         },
     );
 
-    draw_power_chart(frame, top[2], app);
-
     let throttling = app.cur_throttle_rate > 0.0;
     let thr_emoji = if throttling { "⚠️" } else { "✅" };
-    draw_chart(
+    draw_bar_chart(
         frame,
-        bot[0],
-        ChartSpec {
-            title: format!(" {thr_emoji} Throttle  {:.1} ms/s ", app.cur_throttle_rate),
-            series: &app.throttle_rate,
-            color: Color::Red,
+        top[3],
+        BarSpec {
+            title: title_line(
+                format!(" {thr_emoji} Throttle  {:.1} ms/s ", app.cur_throttle_rate),
+                Color::Red,
+            ),
             border_color: if throttling { Color::Red } else { Color::DarkGray },
-            y_min: 0.0,
-            y_max: 10.0,
-            y_pad: 1.0,
+            series: &app.throttle_rate,
+            y_bounds: [0.0, app.throttle_rate.y_bounds(0.0, 10.0, 1.0)[1]],
+            gradient: &[(0.0, "#f97316"), (10.0, "#dc2626")],
             ref_lines: &[],
         },
     );
@@ -786,34 +805,33 @@ fn draw_charts(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         "😴"
     };
-    draw_chart(
+    draw_bar_chart(
         frame,
-        bot[1],
-        ChartSpec {
-            title: format!(" {cpu_emoji} CPU Usage  {:.0}% ", app.cur_cpu),
-            series: &app.cpu_usage,
-            color: Color::Green,
+        bot[0],
+        BarSpec {
+            title: title_line(format!(" {cpu_emoji} CPU Usage  {:.0}% ", app.cur_cpu), Color::Green),
             border_color: Color::Green,
-            y_min: 0.0,
-            y_max: 100.0,
-            y_pad: 5.0,
+            series: &app.cpu_usage,
+            y_bounds: [0.0, app.cpu_usage.y_bounds(0.0, 100.0, 5.0)[1]],
+            gradient: &[(0.0, "#15803d"), (30.0, "#22c55e"), (80.0, "#eab308")],
             ref_lines: &[],
         },
     );
 
+    draw_power_chart(frame, bot[1], app);
     draw_freq_chart(frame, bot[2], app);
 }
 
-struct ChartSpec<'a> {
-    title: String,
-    series: &'a TimeSeries,
-    color: Color,
-    border_color: Color,
-    y_min: f64,
-    y_max: f64,
-    y_pad: f64,
-    // horizontal reference values, drawn dotted when inside the y range
-    ref_lines: &'a [(f64, Color)],
+fn title_line(text: String, color: Color) -> Line<'static> {
+    Line::from(Span::styled(text, Style::default().fg(color).add_modifier(Modifier::BOLD)))
+}
+
+fn panel_block(title: Line, border_color: Color) -> Block {
+    Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color))
 }
 
 fn fmt_ago(secs: f64) -> String {
@@ -822,31 +840,27 @@ fn fmt_ago(secs: f64) -> String {
     format!("-{m}:{s:02}")
 }
 
-fn x_axis<'a>(x_bounds: [f64; 2]) -> Axis<'a> {
+fn x_labels(x_bounds: [f64; 2]) -> Vec<Line<'static>> {
     let range = x_bounds[1] - x_bounds[0];
-    let labels = if range > 0.0 {
-        vec![
-            Line::from(fmt_ago(range)),
-            Line::from(fmt_ago(range / 2.0)),
-            Line::from("now"),
-        ]
-    } else {
-        vec![Line::from("-0:00"), Line::from("now")]
-    };
-    Axis::default()
-        .bounds(x_bounds)
-        .labels(labels)
-        .style(Style::default().fg(Color::DarkGray))
+    vec![
+        Line::from(fmt_ago(range)),
+        Line::from(fmt_ago(range / 2.0)),
+        Line::from("now"),
+    ]
 }
 
-fn y_axis<'a>(y_bounds: [f64; 2]) -> Axis<'a> {
+fn y_labels(y_bounds: [f64; 2]) -> Vec<Line<'static>> {
+    vec![
+        Line::from(format!("{:.0}", y_bounds[0])),
+        Line::from(format!("{:.0}", (y_bounds[0] + y_bounds[1]) / 2.0)),
+        Line::from(format!("{:.0}", y_bounds[1])),
+    ]
+}
+
+fn axis<'a>(bounds: [f64; 2], labels: Vec<Line<'a>>) -> Axis<'a> {
     Axis::default()
-        .bounds(y_bounds)
-        .labels(vec![
-            Line::from(format!("{:.0}", y_bounds[0])),
-            Line::from(format!("{:.0}", (y_bounds[0] + y_bounds[1]) / 2.0)),
-            Line::from(format!("{:.0}", y_bounds[1])),
-        ])
+        .bounds(bounds)
+        .labels(labels)
         .style(Style::default().fg(Color::DarkGray))
 }
 
@@ -861,20 +875,9 @@ fn ref_line_points(x_bounds: [f64; 2], y: f64) -> Vec<(f64, f64)> {
     pts
 }
 
-fn draw_chart(frame: &mut Frame, area: Rect, spec: ChartSpec) {
-    let data = spec.series.as_vec();
-    let y_bounds = spec.series.y_bounds(spec.y_min, spec.y_max, spec.y_pad);
-    let x_bounds = spec.series.x_bounds();
-
-    let ref_data: Vec<(Vec<(f64, f64)>, Color)> = spec
-        .ref_lines
-        .iter()
-        .filter(|(v, _)| *v >= y_bounds[0] && *v <= y_bounds[1])
-        .map(|&(v, c)| (ref_line_points(x_bounds, v), c))
-        .collect();
-
-    // Reference lines first so the main curve draws on top
-    let mut datasets: Vec<Dataset> = ref_data
+/// The dotted datasets of the reference values inside the y range
+fn ref_datasets<'a>(ref_data: &'a [(Vec<(f64, f64)>, Color)]) -> Vec<Dataset<'a>> {
+    ref_data
         .iter()
         .map(|(pts, c)| {
             Dataset::default()
@@ -883,82 +886,93 @@ fn draw_chart(frame: &mut Frame, area: Rect, spec: ChartSpec) {
                 .marker(symbols::Marker::Dot)
                 .style(Style::default().fg(*c))
         })
+        .collect()
+}
+
+fn ref_data(ref_lines: &[(f64, Color)], x_bounds: [f64; 2], y_bounds: [f64; 2]) -> Vec<(Vec<(f64, f64)>, Color)> {
+    ref_lines
+        .iter()
+        .filter(|(v, _)| *v >= y_bounds[0] && *v <= y_bounds[1])
+        .map(|&(v, c)| (ref_line_points(x_bounds, v), c))
+        .collect()
+}
+
+/// Where ratatui's Chart draws its data inside `inner` (its block's inner
+/// area): right of the y labels and the y axis, above the x axis and the x
+/// labels. The first x label is aligned left: all but its last character
+/// stand left of the y axis. The labels take at most a third of the width.
+fn chart_graph_area(inner: Rect, y_labels: &[Line], x_labels: &[Line]) -> Rect {
+    let y_labels_w = y_labels.iter().map(Line::width).max().unwrap_or(0);
+    let x_label_w = x_labels.first().map_or(0, |l| l.width().saturating_sub(1));
+    let left = (y_labels_w.max(x_label_w) as u16).min(inner.width / 3) + 1;
+    Rect {
+        x: inner.x + left,
+        y: inner.y,
+        width: inner.width.saturating_sub(left),
+        height: inner.height.saturating_sub(2),
+    }
+}
+
+struct BarSpec<'a> {
+    title: Line<'a>,
+    border_color: Color,
+    series: &'a TimeSeries,
+    y_bounds: [f64; 2],
+    // Color stops (value, color): a color means the same value whatever
+    // the y range
+    gradient: &'a [(f64, &'a str)],
+    // Horizontal reference values, drawn dotted over the bars when inside
+    // the y range
+    ref_lines: &'a [(f64, Color)],
+}
+
+fn gradient(stops: &[(f64, &str)]) -> colorgrad::LinearGradient {
+    let colors: Vec<&str> = stops.iter().map(|&(_, c)| c).collect();
+    let values: Vec<f32> = stops.iter().map(|&(v, _)| v as f32).collect();
+    colorgrad::GradientBuilder::new()
+        .html_colors(&colors)
+        .domain(&values)
+        .build()
+        .expect("gradient stops: valid colors, values in increasing order")
+}
+
+/// One series as bars, under the same block and axes as the line charts
+fn draw_bar_chart(frame: &mut Frame, area: Rect, spec: BarSpec) {
+    let x_bounds = spec.series.x_bounds();
+    let x_labels = x_labels(x_bounds);
+    let y_labels = y_labels(spec.y_bounds);
+    let block = panel_block(spec.title, spec.border_color);
+
+    // Bars first: the chart then draws its block, axes and dotted lines,
+    // and leaves the cells it does not use as they are
+    let graph = chart_graph_area(block.inner(area), &y_labels, &x_labels);
+    // Braille: two bars per cell
+    let bars: Vec<f64> = spec
+        .series
+        .bars(2 * graph.width as usize)
+        .into_iter()
+        .map(|b| b.unwrap_or(spec.y_bounds[0]))
         .collect();
-    datasets.push(
-        Dataset::default()
-            .data(&data)
-            .graph_type(GraphType::Line)
-            .marker(symbols::Marker::Braille)
-            .style(Style::default().fg(spec.color)),
+    frame.render_widget(
+        BarGraph::new(bars)
+            .with_min(spec.y_bounds[0])
+            .with_max(spec.y_bounds[1])
+            .with_gradient(gradient(spec.gradient))
+            .with_bar_style(BarStyle::Braille)
+            .with_color_mode(ColorMode::VerticalGradient),
+        graph,
     );
 
-    let chart = Chart::new(datasets)
-        .block(
-            Block::default()
-                .title(Span::styled(
-                    spec.title,
-                    Style::default().fg(spec.color).add_modifier(Modifier::BOLD),
-                ))
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(spec.border_color)),
-        )
-        .x_axis(x_axis(x_bounds))
-        .y_axis(y_axis(y_bounds));
-
+    let ref_data = ref_data(spec.ref_lines, x_bounds, spec.y_bounds);
+    let chart = Chart::new(ref_datasets(&ref_data))
+        .block(block)
+        .x_axis(axis(x_bounds, x_labels))
+        .y_axis(axis(spec.y_bounds, y_labels));
     frame.render_widget(chart, area);
 }
 
-/// Package temperature, and SEN1 with its PL1 cut threshold dotted
+/// Package temperature, with the throttle zone dotted
 fn draw_temp_chart(frame: &mut Frame, area: Rect, app: &App) {
-    let data_temp = app.temp.as_vec();
-    let data_sen1 = app.sen1.as_vec();
-
-    let [temp_lo, temp_hi] = app.temp.y_bounds(30.0, 110.0, 5.0);
-    let y_bounds = if app.sen1.data.is_empty() {
-        [temp_lo, temp_hi]
-    } else {
-        let [lo, hi] = app.sen1.y_bounds(30.0, 110.0, 5.0);
-        [temp_lo.min(lo), temp_hi.max(hi)]
-    };
-    let x_bounds = app.temp.x_bounds();
-
-    // Reference lines first so the curves draw on top
-    let ref_lines = [
-        (hw::SEN1_PL1_CUT_C, Color::Cyan),
-        (85.0, Color::LightRed),
-        (95.0, Color::Red),
-    ];
-    let ref_data: Vec<(Vec<(f64, f64)>, Color)> = ref_lines
-        .iter()
-        .filter(|(v, _)| *v >= y_bounds[0] && *v <= y_bounds[1])
-        .map(|&(v, c)| (ref_line_points(x_bounds, v), c))
-        .collect();
-    let mut datasets: Vec<Dataset> = ref_data
-        .iter()
-        .map(|(pts, c)| {
-            Dataset::default()
-                .data(pts)
-                .graph_type(GraphType::Scatter)
-                .marker(symbols::Marker::Dot)
-                .style(Style::default().fg(*c))
-        })
-        .collect();
-    datasets.push(
-        Dataset::default()
-            .data(&data_sen1)
-            .graph_type(GraphType::Line)
-            .marker(symbols::Marker::Braille)
-            .style(Style::default().fg(Color::Cyan)),
-    );
-    datasets.push(
-        Dataset::default()
-            .data(&data_temp)
-            .graph_type(GraphType::Line)
-            .marker(symbols::Marker::Braille)
-            .style(Style::default().fg(Color::Yellow)),
-    );
-
     let temp_emoji = if app.cur_temp >= 85.0 {
         "🔥"
     } else if app.cur_temp >= 70.0 {
@@ -966,44 +980,51 @@ fn draw_temp_chart(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         "❄️"
     };
-    let mut title_spans = vec![
-        Span::styled(
-            format!(" {temp_emoji} Temp  {:.0}°C ", app.cur_temp),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        ),
-    ];
-    if let Some(sen1) = app.cur_sen1 {
-        // Red one degree under the cut: the fan curve is at full speed there
-        let near_cut = sen1 >= hw::SEN1_PL1_CUT_C - 1.0;
-        title_spans.push(Span::styled("SEN1:", Style::default().fg(Color::DarkGray)));
-        title_spans.push(Span::styled(
-            format!("{sen1:.0}°C"),
-            Style::default()
-                .fg(if near_cut { Color::Red } else { Color::Cyan })
-                .add_modifier(Modifier::BOLD),
-        ));
-        title_spans.push(Span::styled(
-            format!(" (cut {:.0}) ", hw::SEN1_PL1_CUT_C),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
+    draw_bar_chart(
+        frame,
+        area,
+        BarSpec {
+            title: title_line(format!(" {temp_emoji} Temp  {:.0}°C ", app.cur_temp), Color::Yellow),
+            border_color: if app.cur_temp >= 85.0 { Color::Red } else { Color::Yellow },
+            series: &app.temp,
+            y_bounds: app.temp.y_bounds(30.0, 110.0, 5.0),
+            gradient: &[(45.0, "#22c55e"), (70.0, "#eab308"), (85.0, "#ef4444"), (95.0, "#d946ef")],
+            ref_lines: &[(85.0, Color::LightRed), (95.0, Color::Red)],
+        },
+    );
+}
 
-    let chart = Chart::new(datasets)
-        .block(
-            Block::default()
-                .title(Line::from(title_spans))
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(if app.cur_temp >= 85.0 {
-                    Color::Red
-                } else {
-                    Color::Yellow
-                })),
-        )
-        .x_axis(x_axis(x_bounds))
-        .y_axis(y_axis(y_bounds));
-
-    frame.render_widget(chart, area);
+/// SEN1, the board sensor the EC watches for the PL1 cut, with the cut
+/// dotted. Its own panel: it moves by a degree or two where the package
+/// moves by tens, and those degrees under the cut are what matters.
+fn draw_sen1_chart(frame: &mut Frame, area: Rect, app: &App) {
+    // Red one degree under the cut: the fan curve is at full speed there
+    let near_cut = app.cur_sen1.is_some_and(|t| t >= fan_curve::SEN1_FULL_C);
+    let color = if near_cut { Color::Red } else { Color::Cyan };
+    let value = app.cur_sen1.map_or("?".into(), |t| format!("{t:.0}°C"));
+    let title = Line::from(vec![
+        Span::styled(format!(" 🎯 SEN1  {value} "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("(cut {:.0}) ", hw::SEN1_PL1_CUT_C), Style::default().fg(Color::DarkGray)),
+    ]);
+    // Always show the cut: the room left under it is the point of this panel
+    let [lo, hi] = app.sen1.y_bounds(30.0, 60.0, 2.0);
+    draw_bar_chart(
+        frame,
+        area,
+        BarSpec {
+            title,
+            border_color: color,
+            series: &app.sen1,
+            y_bounds: [lo, hi.max(hw::SEN1_PL1_CUT_C + 1.0)],
+            // Cyan while the fan curve ignores SEN1, then to red at full speed
+            gradient: &[
+                (fan_curve::SEN1_ZERO_C, "#22d3ee"),
+                ((fan_curve::SEN1_ZERO_C + fan_curve::SEN1_FULL_C) / 2.0, "#eab308"),
+                (fan_curve::SEN1_FULL_C, "#ef4444"),
+            ],
+            ref_lines: &[(hw::SEN1_PL1_CUT_C, Color::Red)],
+        },
+    );
 }
 
 fn draw_power_chart(frame: &mut Frame, area: Rect, app: &App) {
@@ -1101,78 +1122,47 @@ fn draw_power_chart(frame: &mut Frame, area: Rect, app: &App) {
     title_spans.push(Span::styled(" ", Style::default()));
 
     let chart = Chart::new(datasets)
-        .block(
-            Block::default()
-                .title(Line::from(title_spans))
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::Magenta)),
-        )
-        .x_axis(x_axis(x_bounds))
-        .y_axis(y_axis(y_bounds));
+        .block(panel_block(Line::from(title_spans), Color::Magenta))
+        .x_axis(axis(x_bounds, x_labels(x_bounds)))
+        .y_axis(axis(y_bounds, y_labels(y_bounds)));
 
     frame.render_widget(chart, area);
 }
 
 fn draw_freq_chart(frame: &mut Frame, area: Rect, app: &App) {
-    let data_min = app.freq_min.as_vec();
     let data_avg = app.freq_avg.as_vec();
     let data_max = app.freq_max.as_vec();
 
-    // Compute y bounds across all three series
-    let y_lo = app
-        .freq_min
-        .y_bounds(0.0, 5000.0, 100.0)[0]
-        .min(app.freq_avg.y_bounds(0.0, 5000.0, 100.0)[0]);
-    let y_hi = app
-        .freq_max
-        .y_bounds(0.0, 5000.0, 100.0)[1]
-        .max(app.freq_avg.y_bounds(0.0, 5000.0, 100.0)[1]);
+    // avg <= max: the y range goes from the lowest avg to the highest max
+    let y_lo = app.freq_avg.y_bounds(0.0, 5000.0, 100.0)[0];
+    let y_hi = app.freq_max.y_bounds(0.0, 5000.0, 100.0)[1];
     let y_bounds = [y_lo, y_hi.max(y_lo + 100.0)];
     let x_bounds = app.freq_avg.x_bounds();
 
     // Current freq cap as a dotted reference line — makes soft-throttling
     // (freq_max dropping away from the cap) visible at a glance
-    let cap_pts = match app.cur_cap.map(f64::from) {
-        Some(cap) if cap >= y_bounds[0] && cap <= y_bounds[1] => ref_line_points(x_bounds, cap),
-        _ => Vec::new(),
-    };
+    let cap_line: Vec<(f64, Color)> = app.cur_cap.map(|cap| (f64::from(cap), Color::White)).into_iter().collect();
+    let ref_data = ref_data(&cap_line, x_bounds, y_bounds);
 
-    let ds_max = Dataset::default()
-        .data(&data_max)
-        .graph_type(GraphType::Line)
-        .marker(symbols::Marker::Braille)
-        .style(Style::default().fg(Color::Red));
-
-    let ds_avg = Dataset::default()
-        .data(&data_avg)
-        .graph_type(GraphType::Line)
-        .marker(symbols::Marker::Braille)
-        .style(Style::default().fg(Color::Yellow));
-
-    let ds_min = Dataset::default()
-        .data(&data_min)
-        .graph_type(GraphType::Line)
-        .marker(symbols::Marker::Braille)
-        .style(Style::default().fg(Color::Cyan));
-
-    let mut datasets = Vec::new();
-    if !cap_pts.is_empty() {
-        datasets.push(
-            Dataset::default()
-                .data(&cap_pts)
-                .graph_type(GraphType::Scatter)
-                .marker(symbols::Marker::Dot)
-                .style(Style::default().fg(Color::White)),
-        );
-    }
-    datasets.extend([ds_max, ds_avg, ds_min]);
+    let mut datasets = ref_datasets(&ref_data);
+    datasets.push(
+        Dataset::default()
+            .data(&data_max)
+            .graph_type(GraphType::Line)
+            .marker(symbols::Marker::Braille)
+            .style(Style::default().fg(Color::Red)),
+    );
+    datasets.push(
+        Dataset::default()
+            .data(&data_avg)
+            .graph_type(GraphType::Line)
+            .marker(symbols::Marker::Braille)
+            .style(Style::default().fg(Color::Yellow)),
+    );
 
     let title = Line::from(vec![
         Span::styled(" Freq MHz ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::styled("min:", Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{}", app.cur_freq_min), Style::default().fg(Color::Cyan)),
-        Span::styled(" avg:", Style::default().fg(Color::DarkGray)),
+        Span::styled("avg:", Style::default().fg(Color::DarkGray)),
         Span::styled(format!("{}", app.cur_freq_avg), Style::default().fg(Color::Yellow)),
         Span::styled(" max:", Style::default().fg(Color::DarkGray)),
         Span::styled(format!("{}", app.cur_freq_max), Style::default().fg(Color::Red)),
@@ -1180,15 +1170,9 @@ fn draw_freq_chart(frame: &mut Frame, area: Rect, app: &App) {
     ]);
 
     let chart = Chart::new(datasets)
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::Yellow)),
-        )
-        .x_axis(x_axis(x_bounds))
-        .y_axis(y_axis(y_bounds));
+        .block(panel_block(title, Color::Yellow))
+        .x_axis(axis(x_bounds, x_labels(x_bounds)))
+        .y_axis(axis(y_bounds, y_labels(y_bounds)));
 
     frame.render_widget(chart, area);
 }
@@ -1225,11 +1209,6 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ),
         Span::raw("   📊 Freq: "),
-        Span::styled(
-            format!("{}", app.cur_freq_min),
-            Style::default().fg(Color::Cyan),
-        ),
-        Span::styled("/", Style::default().fg(Color::Gray)),
         Span::styled(
             format!("{}", app.cur_freq_avg),
             Style::default().fg(Color::Yellow),
@@ -1483,7 +1462,7 @@ mod tests {
 
     #[test]
     fn dotted_keeps_one_point_per_slot() {
-        let mut series = TimeSeries::new();
+        let mut series = TimeSeries::new(WINDOW_S);
         for (x, y) in [(0.2, 40.0), (1.2, 40.0), (2.9, 40.0), (3.1, 12.0), (5.0, 12.0), (6.4, 12.0)] {
             series.push(x, y);
         }
@@ -1491,6 +1470,73 @@ mod tests {
         // The oldest point scrolls out: the other dots do not move
         series.data.pop_front();
         assert_eq!(series.dotted(), vec![(1.2, 40.0), (3.1, 12.0), (6.4, 12.0)]);
+    }
+
+    #[test]
+    fn series_keeps_its_window_only() {
+        let mut series = TimeSeries::new(10.0);
+        for x in 0..=15 {
+            series.push(x as f64, 1.0);
+        }
+        assert_eq!(series.data.front(), Some(&(5.0, 1.0)));
+        assert_eq!(series.x_bounds(), [5.0, 15.0]);
+        // Just after start: the scale is already the whole window
+        let mut series = TimeSeries::new(10.0);
+        series.push(2.0, 1.0);
+        assert_eq!(series.x_bounds(), [-8.0, 2.0]);
+    }
+
+    #[test]
+    fn bars_keep_peaks_and_fill_gaps() {
+        let mut series = TimeSeries::new(8.0);
+        for (x, y) in [(4.0, 1.0), (4.5, 7.0), (5.0, 2.0), (8.0, 3.0)] {
+            series.push(x, y);
+        }
+        // Window [0, 8], 1 s per bar: nothing before 4 s, the peak of
+        // [4, 5), the last value held over [6, 8), the newest in the last bar
+        assert_eq!(
+            series.bars(8),
+            vec![None, None, None, None, Some(7.0), Some(2.0), Some(2.0), Some(3.0)]
+        );
+        assert_eq!(series.bars(0), vec![]);
+    }
+
+    #[test]
+    fn graph_area_is_where_chart_draws() {
+        // The corner of ratatui's axes is right under and left of the graph area
+        for (width, y_bounds) in [(40, [0.0, 7000.0]), (60, [46.0, 55.0]), (12, [0.0, 10.0])] {
+            let area = Rect::new(0, 0, width, 12);
+            let block = Block::default().borders(Borders::ALL);
+            let (x_bounds, x_labels, y_labels) = ([-120.0, 0.0], x_labels([-120.0, 0.0]), y_labels(y_bounds));
+            let graph = chart_graph_area(block.inner(area), &y_labels, &x_labels);
+            let mut buf = ratatui::buffer::Buffer::empty(area);
+            ratatui::widgets::Widget::render(
+                Chart::new(vec![])
+                    .block(block)
+                    .x_axis(axis(x_bounds, x_labels))
+                    .y_axis(axis(y_bounds, y_labels)),
+                area,
+                &mut buf,
+            );
+            let corner = buf
+                .content()
+                .iter()
+                .position(|c| c.symbol() == symbols::line::BOTTOM_LEFT)
+                .map(|i| buf.pos_of(i))
+                .expect("chart draws its axes");
+            assert_eq!((corner.0 + 1, corner.1), (graph.x, graph.bottom()), "width {width}");
+            assert_eq!(graph.right(), area.right() - 1);
+            assert_eq!(graph.top(), area.top() + 1);
+        }
+    }
+
+    #[test]
+    fn gradient_colors_mean_values_not_heights() {
+        use colorgrad::Gradient;
+        let g = gradient(&[(50.0, "#00ff00"), (53.0, "#ff0000")]);
+        assert_eq!(g.at(40.0).to_rgba8(), [0, 255, 0, 255]);
+        assert_eq!(g.at(53.0).to_rgba8(), [255, 0, 0, 255]);
+        assert_eq!(g.at(60.0).to_rgba8(), [255, 0, 0, 255]);
     }
 
     #[test]
