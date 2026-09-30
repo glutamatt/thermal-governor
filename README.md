@@ -44,6 +44,19 @@ need       = max(need_power, need_temp, need_sen1)          each clamped to 0..1
 
 The numbers are constants at the top of `src/fan_curve.rs`.
 
+### Shadow controller
+
+A second controller runs next to the curve, in **shadow mode**: it computes what it would do every second and logs it, and writes nothing. It keeps SEN1 under the 54 °C cut with two levers, the fan and a PL2 package power limit (which slows the CPU gracefully, with no drop to 400 MHz):
+
+```
+observer : a Kalman filter on SEN1 and the (unmeasured) ambient, with the model
+           dSEN1/dt = (ambient + G(rpm) · power − SEN1) / 209 s
+fan      : the rpm that keeps SEN1 under 52.5 °C in 60 s at the current power
+PL2      : the highest power that keeps SEN1 under 53 °C in 40 s at full fan, never under 18 W
+```
+
+Its decisions are the `shadow_*` columns of the daily log, and `[shadow]` lines in the journal when it would limit the power. Replayed on 3 days of logs, it avoids the 5 drops the curve let through, with 27 % less fan. The numbers are constants at the top of `src/controller.rs`; the replay is in `.claude/skills/thermal-governor/SKILL.md`.
+
 ### Fan modes
 
 The mode lives in `/run/thermal-governor/fan-mode`, so **every boot starts on the curve**.

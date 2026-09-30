@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use thermal_governor::clock::{self, LocalTime};
+use thermal_governor::controller::{self, Controller};
 use thermal_governor::fan_curve::{self, Curve, FanMode, Status};
 use thermal_governor::hw::{self, FanSensor};
 
@@ -139,11 +140,13 @@ struct Sample {
     sen2_c: Option<f64>,
     fan_mode: &'static str,
     fan_need: f64,
+    /// What the shadow controller would do; None when SEN1 or RAPL is unreadable
+    shadow: Option<controller::Decision>,
 }
 
 impl Sample {
     fn csv_header() -> &'static str {
-        "timestamp,temp_c,temp_rate,cpu_load,fan1_rpm,fan2_rpm,fan_level,freq_min,freq_avg,freq_max,freq_cap_mhz,epp,throttle_rate,rapl_power_w,platform_profile,pl1_w,fan_mode,fan_need,sen1_c,sen2_c"
+        "timestamp,temp_c,temp_rate,cpu_load,fan1_rpm,fan2_rpm,fan_level,freq_min,freq_avg,freq_max,freq_cap_mhz,epp,throttle_rate,rapl_power_w,platform_profile,pl1_w,fan_mode,fan_need,sen1_c,sen2_c,shadow_sen1_c,shadow_ambient_c,shadow_sen1_pred_c,shadow_fan_rpm,shadow_fan_level,shadow_pl2_w"
     }
 
     fn to_csv_row(&self) -> String {
@@ -152,8 +155,17 @@ impl Sample {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        let shadow = self.shadow.as_ref().map_or_else(
+            || ",,,,,".to_string(),
+            |d| {
+                format!(
+                    "{:.2},{:.2},{:.2},{:.0},{},{:.1}",
+                    d.sen1_c, d.ambient_c, d.sen1_pred_c, d.fan_rpm, d.fan_level, d.pl2_w
+                )
+            },
+        );
         format!(
-            "{},{:.1},{:.2},{:.3},{},{},{},{},{},{},{},{},{:.1},{:.2},{},{},{},{:.2},{},{}",
+            "{},{:.1},{:.2},{:.3},{},{},{},{},{},{},{},{},{:.1},{:.2},{},{},{},{:.2},{},{},{}",
             ts,
             self.temp_c,
             self.temp_rate,
@@ -174,6 +186,7 @@ impl Sample {
             self.fan_need,
             fmt_opt_c(self.sen1_c),
             fmt_opt_c(self.sen2_c),
+            shadow,
         )
     }
 }
@@ -367,6 +380,51 @@ impl Pl1Watch {
         let profile_pl1 = self.profile_pl1_w.map_or(pl1, |p| p.max(pl1));
         self.profile_pl1_w = Some(profile_pl1);
         pl1 < profile_pl1 - 0.5
+    }
+}
+
+// =============================================================================
+// Shadow controller: log when it would limit the power
+// =============================================================================
+
+/// The shadow controller writes nothing, so its PL2 limits nothing: it "would
+/// limit" when its PL2 is under the power the package draws. One log line
+/// when that starts and one when it ends, not one per second.
+#[derive(Default)]
+struct ShadowWatch {
+    /// Seconds limited so far and the lowest PL2, while it would limit
+    limiting: Option<(u32, f64)>,
+}
+
+impl ShadowWatch {
+    /// Returns true while the shadow would limit
+    fn update(&mut self, decision: Option<&controller::Decision>, power_w: Option<f64>) -> bool {
+        let limit = decision.zip(power_w).filter(|(d, p)| d.pl2_w < p - 0.5);
+        match (limit, self.limiting.as_mut()) {
+            (Some((d, p)), None) => {
+                log(
+                    "shadow",
+                    &format!(
+                        "Would limit PL2 to {:.1} W (package {p:.1} W, SEN1 {:.2} °C, ambient {:.1} °C, fan {})",
+                        d.pl2_w, d.sen1_c, d.ambient_c, d.fan_level
+                    ),
+                );
+                self.limiting = Some((1, d.pl2_w));
+            }
+            (Some((d, _)), Some((secs, lowest))) => {
+                *secs += 1;
+                *lowest = lowest.min(d.pl2_w);
+            }
+            (None, Some(&mut (secs, lowest))) => {
+                log(
+                    "shadow",
+                    &format!("Would release PL2 after {secs} s (lowest {lowest:.1} W)"),
+                );
+                self.limiting = None;
+            }
+            (None, None) => {}
+        }
+        self.limiting.is_some()
     }
 }
 
@@ -758,10 +816,15 @@ struct MinuteStats {
     drop_s: u32,
     pl1_min_w: Option<f64>,
     sen1_max_c: Option<f64>,
+    /// Seconds the shadow controller would have limited the power
+    shadow_limit_s: u32,
 }
 
 impl MinuteStats {
-    fn record(&mut self, s: &Sample) {
+    fn record(&mut self, s: &Sample, shadow_limiting: bool) {
+        if shadow_limiting {
+            self.shadow_limit_s += 1;
+        }
         self.samples += 1;
         let rpm = s.fan1_rpm.max(s.fan2_rpm);
         self.rpm_sum += rpm as u64;
@@ -784,12 +847,13 @@ impl MinuteStats {
     fn summary(&self) -> String {
         let n = self.samples.max(1);
         format!(
-            "rpm_avg={} fan_off={}% drop_s={} pl1_min={} sen1_max={}",
+            "rpm_avg={} fan_off={}% drop_s={} pl1_min={} sen1_max={} shadow_limit_s={}",
             self.rpm_sum / n as u64,
             self.fan_off * 100 / n,
             self.drop_s,
             self.pl1_min_w.map_or("?".into(), |w| format!("{w:.0}W")),
             self.sen1_max_c.map_or("?".into(), |t| format!("{t:.0}°C")),
+            self.shadow_limit_s,
         )
     }
 }
@@ -873,6 +937,8 @@ fn observer(stop: &AtomicBool) {
     let mut detector = EventDetector::new();
     let mut fan_driver = FanDriver::new();
     let mut pl1_watch = Pl1Watch::new();
+    let mut shadow = Controller::new();
+    let mut shadow_watch = ShadowWatch::default();
     let mut daily_log = DailyLog::new();
     let mut minute = MinuteStats::default();
     let mut prev_tick = Instant::now();
@@ -940,6 +1006,18 @@ fn observer(stop: &AtomicBool) {
             }
         }
 
+        // --- Shadow controller: computes and logs, writes nothing ---
+        let shadow_decision = shadow.update(
+            dt,
+            &controller::Inputs {
+                sen1_c,
+                power_w: rapl_r,
+                rpm: f64::from(f1 + f2) / 2.0,
+                guard: fan_status.guard.is_some(),
+            },
+        );
+        let shadow_limiting = shadow_watch.update(shadow_decision.as_ref(), rapl_r);
+
         let sample = Sample {
             timestamp: SystemTime::now(),
             temp_c: temp,
@@ -962,8 +1040,9 @@ fn observer(stop: &AtomicBool) {
             sen2_c,
             fan_mode: fan_status.mode.as_str(),
             fan_need: fan_status.need,
+            shadow: shadow_decision,
         };
-        minute.record(&sample);
+        minute.record(&sample, shadow_limiting);
         daily_log.write(&sample);
 
         // --- Push to rolling buffer ---
@@ -1006,7 +1085,7 @@ fn observer(stop: &AtomicBool) {
             log(
                 "status",
                 &format!(
-                    "{:.0}°C Δ{:+.1}°C/s load={:.0}% fan={} ({}, need {:.2}) rpm={}/{} freq={}/{}/{} cap={} epp={} profile={} pl1={}{} rapl={:.1}W sen1={} sen2={} | last min: {}",
+                    "{:.0}°C Δ{:+.1}°C/s load={:.0}% fan={} ({}, need {:.2}) rpm={}/{} freq={}/{}/{} cap={} epp={} profile={} pl1={}{} rapl={:.1}W sen1={} sen2={} shadow: {} | last min: {}",
                     temp, temp_rate, load * 100.0,
                     fan_level, fan_status.mode.as_str(), fan_status.need, f1, f2,
                     sample.freq_min, sample.freq_avg, sample.freq_max,
@@ -1016,6 +1095,10 @@ fn observer(stop: &AtomicBool) {
                     rapl_w,
                     sen1_c.map_or("?".into(), |t| format!("{t:.0}°C")),
                     sen2_c.map_or("?".into(), |t| format!("{t:.0}°C")),
+                    sample.shadow.as_ref().map_or("?".into(), |d| format!(
+                        "fan={} pl2={:.0}W ambient={:.1}°C sen1_in_30s={:.1}°C",
+                        d.fan_level, d.pl2_w, d.ambient_c, d.sen1_pred_c
+                    )),
                     minute.summary(),
                 ),
             );
@@ -1034,6 +1117,7 @@ fn main() {
     eprintln!("================================================");
     eprintln!("  thermal-governor v{}", env!("CARGO_PKG_VERSION"));
     eprintln!("  Fan curve + settings keeper for ThinkPad X1");
+    eprintln!("  Shadow fan + power controller: logs only, writes nothing");
     eprintln!("================================================");
     eprintln!("  Settings: {SETTINGS_FILE}");
     eprintln!("  Events:   {EVENTS_DIR}/");
@@ -1096,7 +1180,46 @@ mod tests {
             sen2_c: Some(48.0),
             fan_mode: "curve",
             fan_need: 0.0,
+            shadow: None,
         }
+    }
+
+    fn decision(pl2_w: f64) -> controller::Decision {
+        controller::Decision {
+            sen1_c: 52.4,
+            ambient_c: 36.8,
+            sen1_pred_c: 53.1,
+            fan_rpm: 9800.0,
+            fan_level: "disengaged",
+            pl2_w,
+        }
+    }
+
+    #[test]
+    fn csv_row_has_every_column_with_or_without_the_shadow() {
+        let columns = Sample::csv_header().split(',').count();
+        let mut s = sample(60.0, 0.0, 0.0);
+        assert_eq!(s.to_csv_row().split(',').count(), columns);
+        s.shadow = Some(decision(18.0));
+        let row = s.to_csv_row();
+        assert_eq!(row.split(',').count(), columns);
+        assert!(row.ends_with(",52.40,36.80,53.10,9800,disengaged,18.0"), "{row}");
+    }
+
+    #[test]
+    fn shadow_watch_sees_a_limit_start_and_end() {
+        let mut w = ShadowWatch::default();
+        // PL2 over the power: nothing to limit
+        assert!(!w.update(Some(&decision(64.0)), Some(26.0)));
+        assert!(w.update(Some(&decision(19.0)), Some(26.0)));
+        assert!(w.update(Some(&decision(18.0)), Some(24.0)));
+        assert_eq!(w.limiting, Some((2, 18.0)));
+        // The load ends: the power falls under the PL2
+        assert!(!w.update(Some(&decision(18.0)), Some(9.0)));
+        assert_eq!(w.limiting, None);
+        // No decision (SEN1 unreadable) ends it too
+        assert!(w.update(Some(&decision(18.0)), Some(26.0)));
+        assert!(!w.update(None, Some(26.0)));
     }
 
     #[test]

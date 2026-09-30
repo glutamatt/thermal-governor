@@ -80,9 +80,8 @@ Tests: cap 2000, EPP `performance`, `stress-ng --cpu N`, fixed fan levels, 1 Hz 
   stopped, at ~62 °C package, even with the fan at level 0 (4 times on 2026-09-25). Under
   sustained load it did not come back: 9.5 min at 12 W and 400–800 MHz during a series of
   builds, with the fan curve down to level 1–2 because the capped power lowers its power
-  input. The SEN1 value at recovery (the hysteresis) is not known yet. The daemon logs
-  SEN1 and SEN2 since 2026-09-28 (event CSVs and status line), so the next
-  `pl1-cut` event CSV will show it.
+  input. **The cut ends when SEN1 reads 52 °C or less** (all 7 cuts of 2026-09-29: on at
+  54, off at 52).
 - **The fan cools SEN1 about twice as fast at light load** (test of 2026-09-28,
   `sen1-decay-20260928-120805.csv`, ~6 W of real use, after a morning of work): fan 0
   gave 51 → 49 °C in 3 min (~0.7 °C/min), level 2 gave 49 → 43 °C in 5 min
@@ -201,6 +200,50 @@ matrixprod`, cap 4800, fan on the curve, bogo ops/s):
   under the cut. A 25 W burst at fan 0 then gains ~0.14 °C/s, so the cut comes in ~45 s
   unless the fan starts. That matches the cuts seen after builds.
 
+## The controller: replay of the 7 cuts, and shadow mode (2026-09-30)
+
+Scripts (not in the repo): `/var/lib/thermal-governor/tests/scripts/replay-20260930/`.
+
+- **The 7 cuts of 2026-09-29 have one cause**: SEN1 sat at 51–52 °C under light load
+  (~10 W, fan level 1–5), and a burst of ~26 W for 15–30 s (all cores at cap 2000) added
+  2–3 °C. Of 34 bursts over 20 W in 3 days, every one that started at SEN1 ≥ 51 in the
+  afternoon of 09-29 came close to or reached the cut. Only 5 of the 7 cuts clamped a
+  load (15:19 and 15:23 came when the burst was already over).
+- **The curve is ~20 s late on a burst**: `POWER_TAU_S` = 10 s delays the full-speed
+  command by 10–14 s, then the fan needs ~8 s to spin up (level 1 → 9000 RPM).
+- **The SEN1 model needs no fast part**: first order with a fan-dependent gain,
+  `G(rpm) = 1 / (0.3956 + 0.0600 · rpm/1000)` °C/W (2.53 at fan off, 1.57 at 4000 RPM,
+  1.01 at full speed), τ = 209 s. Fitted on the windows around the 34 bursts with a free
+  ambient per window: 0.50 °C rms, 1.7 °C max. Same numbers as the step tests above.
+- **The effective ambient is the big unknown**: ~37 °C in the afternoon of 09-29, 30 °C
+  on 09-28, 26 °C on 09-25. Fitted over whole days it moves by degrees within minutes,
+  which no room does: it also carries what the model misses (heat from other parts,
+  the laptop's position). At 37 °C and full fan, SEN1 holds under 54 °C only below
+  ~17 W: a sustained all-core load then gets cut whatever the fan does.
+- **Replay**: a closed-loop simulator (plant = the model with the ambient fitted every
+  5 min, EC cut at reading 54 / release at 52, PL1 on a 28 s average) replays the current
+  curve on the 3 days and finds the same 5 clamped cuts, within seconds of the real ones.
+- **Observer**: a Kalman filter on (SEN1, ambient), started from the reading with the
+  ambient that explains it at equilibrium. On the real readings, with a restart every
+  30 min, it predicts SEN1 60 s ahead (with the real power) within 0.52 °C rms (1.4 °C
+  p99); a fixed-gain observer gave 1.34 °C, and its ambient took over an hour to converge
+  after a start (a start at a wrong ambient then led to a cut in the unit test).
+- **The law** (`src/controller.rs`): fan = the rpm that keeps SEN1 under 52.5 °C in 60 s
+  at the current power; PL2 = the highest power that keeps SEN1 under 53 °C in 40 s at
+  full fan, never under 18 W (~66 % of the throughput of a 26 W burst; lower, the limit
+  would be a drop by itself). Cost used to tune it (the user's choice): one drop = 10 min
+  of full fan; fan noise counted as (rpm/9800)^1.5, a drop = delivered throughput under
+  half of the demand's. Among the settings with zero drops on 4 plants (nominal, G +10 %
+  τ −15 %, G −10 % τ +15 %, ambient +2 °C), the one with the least fan.
+- **Replay result** (3 days, ~25 h): 0 drops instead of 5; fan −27 % (off 71 % of the
+  time instead of 59.5 %); the power limited ~14 min in all, mostly at 18–19 W. With the
+  ambient 2 °C higher: 0 drops instead of 12. Hotter plant and +2 °C together: 11 instead
+  of 24 (the 18 W floor is above what SEN1 can hold). Open loop on the real 09-29 data,
+  it would have limited the power 29–120 s before each of the 7 cuts.
+- **Not validated yet**: the plant is the model itself (optimistic); ~1500 MHz at 18 W
+  comes from the cap-4800 test; the package temperature and the demand are the logged
+  ones (a limited load would last longer); only one day had cuts.
+
 ## Working on this
 
 - **The daemon runs one control loop: the fan curve** (`src/fan_curve.rs`), asked for on
@@ -209,6 +252,13 @@ matrixprod`, cap 4800, fan on the curve, bogo ops/s):
   cut keeps its power input from falling (GitHub issue #3). It never touches the
   cap, EPP or profile on its own: those stay manual (`hw-tui`), the daemon only saves and
   restores them. The learned auto-tuner is abandoned; don't bring it back unasked.
+- **The fan + power controller runs in shadow mode** since 2026-09-30
+  (`src/controller.rs`, asked for by the user): the daemon computes its fan level and PL2
+  every second and logs them (`shadow_*` columns of the daily log, `[shadow]` lines when
+  it would limit the power, the status line), and writes nothing. Before it writes the
+  MSR PL2: a limit left there survives the daemon (unlike the fan, the EC takes nothing
+  back), so the daemon must restore the firmware value on exit and at start, and never
+  write under the floor.
 - **Fan modes** (`/run/thermal-governor/fan-mode`, so every boot starts on `curve`):
   `curve` (daemon), `auto` (EC), `manual` (`hw-tui`). Hard limits (package ≥ 80 °C, SEN ≥
   70 °C) force full speed in curve and manual mode, then fall slowly (30 s). In
